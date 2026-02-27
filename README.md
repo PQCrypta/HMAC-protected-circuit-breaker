@@ -161,6 +161,59 @@ Example canonical form for the HMAC input:
 {"auth":{"consecutive_failures":1,"reason":"timeout","status":"open"},"db":{"consecutive_failures":0,"status":"closed"}}
 ```
 
+> **Note:** Field order within each service entry is alphabetical — `consecutive_failures`
+> before `status`. The outer map is also alphabetical by service name. This matches
+> Rust's `serde_json` default behaviour (BTreeMap-backed objects).
+
+### Cross-Language Producers
+
+Any language can produce a compatible state file as long as the HMAC is computed
+over the canonically serialised `algorithms` block.
+
+**Python (requires `sort_keys=True`):**
+
+```python
+import json, hmac, hashlib
+
+def write_circuit_state(path: str, algorithms: dict, secret: str) -> None:
+    """Write a HMAC-signed circuit breaker state file."""
+    # CRITICAL: sort_keys=True is required — Rust serde_json sorts keys alphabetically.
+    # Using sort_keys=False produces a different byte sequence and the HMAC will fail.
+    algorithms_json = json.dumps(algorithms, separators=(',', ':'), sort_keys=True)
+
+    mac = hmac.new(secret.encode(), algorithms_json.encode(), hashlib.sha256)
+    integrity_hash = mac.hexdigest()
+
+    state = {
+        "updated_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "threshold": 3,
+        "integrity_hash": integrity_hash,
+        "algorithms": dict(sorted(algorithms.items())),  # outer map also sorted
+    }
+    with open(path, "w") as f:
+        json.dump(state, f, indent=2)
+
+# Example usage
+algorithms = {
+    "payments": {"status": "closed", "consecutive_failures": 0},
+    "auth":     {"status": "tripped", "consecutive_failures": 3,
+                 "since": "2026-02-27T14:00:00Z",
+                 "reason": "connection refused"},
+}
+write_circuit_state("/var/run/myapp/circuit_breaker.json", algorithms, "my-secret")
+```
+
+**Shell (OpenSSL):**
+
+```bash
+# Build canonical JSON manually (outer keys and inner keys must be alphabetically sorted)
+ALGORITHMS_JSON='{"auth":{"consecutive_failures":3,"reason":"timeout","status":"tripped"},"payments":{"consecutive_failures":0,"status":"closed"}}'
+SECRET="my-secret"
+
+HASH=$(echo -n "$ALGORITHMS_JSON" | openssl dgst -sha256 -hmac "$SECRET" -hex | awk '{print $2}')
+echo "integrity_hash: $HASH"
+```
+
 ---
 
 ## Architecture
