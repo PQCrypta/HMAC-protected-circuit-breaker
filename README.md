@@ -174,6 +174,7 @@ over the canonically serialised `algorithms` block.
 
 ```python
 import json, hmac, hashlib
+from datetime import datetime, timezone
 
 def write_circuit_state(path: str, algorithms: dict, secret: str) -> None:
     """Write a HMAC-signed circuit breaker state file."""
@@ -185,7 +186,7 @@ def write_circuit_state(path: str, algorithms: dict, secret: str) -> None:
     integrity_hash = mac.hexdigest()
 
     state = {
-        "updated_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "threshold": 3,
         "integrity_hash": integrity_hash,
         "algorithms": dict(sorted(algorithms.items())),  # outer map also sorted
@@ -231,14 +232,21 @@ echo "integrity_hash: $HASH"
  ┌────────────────────────▼────────────────────────────────┐
  │  API server (consumer)                                  │
  │                                                         │
- │  Background task reloads file every 60 s:               │
+ │  Layer 1 — File-based state (SharedState)               │
+ │    Background task reloads file every 60 s:             │
  │    • Verify HMAC — on mismatch: clear state (fail-open) │
  │    • Update Arc<RwLock<HashMap>> in-memory state        │
  │                                                         │
- │  Per-request middleware:                                 │
- │    • Extract service name from URL                      │
- │    • Check status in memory (O(1) read, no contention)  │
- │    • If Tripped → 503; otherwise → pass through         │
+ │  Layer 2 — In-process runtime state (RuntimeState)      │
+ │    Middleware tracks 5xx responses per service:         │
+ │    • threshold consecutive 5xx → trip immediately       │
+ │    • No waiting for the next health-check cycle         │
+ │    • Half-open probing auto-recovers after cooldown     │
+ │                                                         │
+ │  Per-request middleware (both layers checked):          │
+ │    • Extract service name from URL path                 │
+ │    • File state Tripped  → 503 immediately              │
+ │    • Runtime state Tripped → 503 immediately            │
  │    • bypass header → always pass through (health cron)  │
  └─────────────────────────────────────────────────────────┘
 ```
@@ -372,6 +380,12 @@ async fn main() {
 
     if let Some(state) = handle.get("payments").await {
         println!("{}: {} failures", state.status, state.consecutive_failures);
+    }
+
+    // Full snapshot of all tracked services (useful for health/status endpoints)
+    let all = handle.snapshot().await;
+    for (name, state) in &all {
+        println!("{name}: {}", state.status);
     }
 }
 ```
