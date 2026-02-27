@@ -1,0 +1,45 @@
+[package]
+name = "hmac-circuit-breaker"
+version = "0.1.0"
+edition = "2021"
+authors = ["PQCrypta <allan@pqcrypta.com>"]
+description = "HMAC-protected circuit breaker with fail-open semantics. Persists circuit state to disk and verifies integrity with HMAC-SHA256 on every reload to prevent state-file tampering from inducing self-DoS."
+license = "MIT"
+repository = "https://github.com/PQCrypta/HMAC-protected-circuit-breaker"
+documentation = "https://docs.rs/hmac-circuit-breaker"
+readme = "README.md"
+keywords = ["circuit-breaker", "hmac", "resilience", "fault-tolerance", "middleware"]
+categories = ["network-programming", "cryptography", "web-programming::http-server"]
+rust-version = "1.75"
+
+[features]
+default = ["reload"]
+# Enables the background tokio reload task (spawn_reload)
+reload = ["dep:tokio"]
+# Enables the optional axum middleware layer
+axum = ["dep:axum", "reload"]
+
+[dependencies]
+hmac      = "0.12"
+sha2      = "0.10"
+serde     = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tracing   = "0.1"
+
+chrono = { version = "0.4", features = ["serde"] }
+tokio  = { version = "1", features = ["time", "fs", "sync", "rt"], optional = true }
+axum   = { version = "0.7", optional = true }
+
+[dev-dependencies]
+tokio    = { version = "1", features = ["full", "test-util"] }
+tempfile = "3"
+tracing-subscriber = "0.3"
+
+[[example]]
+name = "basic"
+required-features = ["reload"]
+
+[[example]]
+name = "with_axum"
+required-features = ["axum"]
