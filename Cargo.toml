@@ -1,6 +1,6 @@
 [package]
 name = "hmac-circuit-breaker"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 authors = ["PQCrypta <allan@pqcrypta.com>"]
 description = "HMAC-protected circuit breaker with fail-open semantics. Persists circuit state to disk and verifies integrity with HMAC-SHA256 on every reload to prevent state-file tampering from inducing self-DoS."
