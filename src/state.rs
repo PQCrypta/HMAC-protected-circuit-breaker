@@ -71,3 +71,46 @@ pub struct CircuitBreakerFile {
     /// which is required for deterministic HMAC computation.
     pub algorithms: BTreeMap<String, AlgorithmCircuitState>,
 }
+
+// ── In-process runtime state (never persisted) ───────────────────────────────
+
+/// Status of the in-process runtime circuit.
+///
+/// Complements the file-based [`CircuitStatus`] by tracking failures that
+/// occur within the **current process lifetime** — no external producer needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RuntimeStatus {
+    /// No in-process failures recorded; requests pass through normally.
+    #[default]
+    Closed,
+    /// In-process failure threshold reached; requests are rejected.
+    ///
+    /// After [`CircuitBreakerConfig::half_open_timeout`] elapses, exactly one
+    /// probe request is allowed through.  A successful probe closes the circuit;
+    /// a failed probe resets the cooldown and stays tripped.
+    Tripped,
+    /// Cooldown has elapsed; one probe is in flight.
+    HalfOpen,
+}
+
+/// In-process per-service circuit state owned by the middleware.
+///
+/// Never written to disk.  Complements the HMAC-verified file-based state by
+/// detecting failures within the current process (e.g. while the health-check
+/// cron is between runs).
+#[derive(Debug, Default)]
+pub struct RuntimeServiceState {
+    /// Current runtime circuit status.
+    pub status: RuntimeStatus,
+    /// Consecutive 5xx responses since the last reset.
+    pub consecutive_failures: u32,
+    /// Consecutive successful probes while [`HalfOpen`](RuntimeStatus::HalfOpen).
+    pub consecutive_successes: u32,
+    /// Monotonic timestamp of when the runtime circuit was tripped.
+    pub tripped_at: Option<std::time::Instant>,
+    /// `true` while a half-open probe is in flight.
+    pub probe_in_flight: bool,
+    /// When the current (or most recent) probe was started; used to detect
+    /// dropped connections so the probe slot is eventually freed.
+    pub probe_started_at: Option<std::time::Instant>,
+}

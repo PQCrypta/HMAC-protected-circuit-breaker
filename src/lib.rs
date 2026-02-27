@@ -28,9 +28,9 @@
 //! cycle, not weaponise it. The integrity violation is logged as a warning so operators
 //! are alerted immediately.
 //!
-//! ## State Machine
+//! ## State Machines
 //!
-//! Each named service cycles through three states:
+//! ### File-based state (written by external producer)
 //!
 //! ```text
 //!                        pass
@@ -38,24 +38,42 @@
 //! │  Closed  │────────►│ Open │─────────►│ Tripped │
 //! │ (normal) │         │      │          │(blocked)│
 //! └──────────┘         └──┬───┘          └────┬────┘
-//!      ▲                  │ pass               │ pass
+//!      ▲                  │ pass               │ pass (next health cycle)
 //!      └──────────────────┴────────────────────┘
 //! ```
 //!
-//! * **Closed** – service healthy, requests pass through.
-//! * **Open** – failure detected but below threshold; requests still pass.
-//! * **Tripped** – consecutive failures reached the threshold; requests are blocked with
-//!   503 until the service recovers.
+//! ### In-process runtime state (managed by the axum middleware)
+//!
+//! ```text
+//!                 fail×N           cooldown elapsed
+//! ┌──────────┐  ────────►  ┌─────────┐  ──────────►  ┌──────────┐
+//! │  Closed  │             │ Tripped │               │ HalfOpen │
+//! │ (normal) │  ◄────────  │(blocked)│  ◄──────────  │ (1 probe)│
+//! └──────────┘   recover   └─────────┘  probe fail   └────┬─────┘
+//!                                                         │ probe ok
+//!      ▲──────────────────────────────────────────────────┘
+//! ```
+//!
+//! * **Closed** – no in-process failures; requests pass through.
+//! * **Tripped** – `threshold` consecutive 5xx responses from the inner service.
+//!   Requests are rejected with 503 until the cooldown elapses.
+//! * **HalfOpen** – one probe request is allowed through.  Success → Closed;
+//!   failure → Tripped (cooldown restarts).
 //!
 //! ## Architecture
 //!
-//! The circuit state lives in two places:
+//! Circuit state is tracked in two complementary layers:
 //!
-//! 1. **On disk** – a JSON file with an embedded `integrity_hash` field. A separate
-//!    process (health-check cron, monitoring daemon, etc.) writes this file after
-//!    probing the services.
-//! 2. **In memory** – an `Arc<RwLock<HashMap>>` reloaded from disk every *N* seconds
-//!    by a background task. The in-memory view is what the middleware checks per-request.
+//! 1. **On disk** — a JSON file written by an external producer (health-check
+//!    cron, monitoring daemon) with an embedded HMAC-SHA256 tag.
+//!    Verified on every reload; mismatch → fail-open.
+//! 2. **In memory** — two `Arc<RwLock<HashMap>>` maps:
+//!    * `SharedState` — reloaded from disk every *N* seconds; reflects the
+//!      external producer's view of each service.
+//!    * `RuntimeState` — managed entirely by the axum middleware; trips
+//!      immediately when the **current process** observes consecutive failures,
+//!      then auto-recovers via half-open probing without waiting for the next
+//!      health-check cycle.
 //!
 //! ## Quick Start
 //!
@@ -100,15 +118,20 @@ pub mod writer;
 pub mod middleware;
 
 pub use config::{CircuitBreakerConfig, CircuitBreakerConfigBuilder};
-pub use state::{AlgorithmCircuitState, CircuitStatus};
+pub use state::{AlgorithmCircuitState, CircuitStatus, RuntimeServiceState, RuntimeStatus};
 pub use writer::write_state;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-/// Shared in-memory circuit breaker state, cheaply cloneable.
+/// Shared in-memory file-based circuit state, cheaply cloneable.
 pub type SharedState = Arc<RwLock<HashMap<String, AlgorithmCircuitState>>>;
+
+/// Shared in-process runtime circuit state, cheaply cloneable.
+///
+/// Managed entirely by the axum middleware — never persisted to disk.
+pub type RuntimeState = Arc<RwLock<HashMap<String, RuntimeServiceState>>>;
 
 /// High-level handle that owns the shared state and the config.
 ///
@@ -116,6 +139,7 @@ pub type SharedState = Arc<RwLock<HashMap<String, AlgorithmCircuitState>>>;
 #[derive(Clone)]
 pub struct CircuitBreakerHandle {
     pub(crate) state: SharedState,
+    pub(crate) runtime: RuntimeState,
     pub(crate) config: Arc<CircuitBreakerConfig>,
 }
 
@@ -124,6 +148,7 @@ impl CircuitBreakerHandle {
     pub fn new(config: CircuitBreakerConfig) -> Self {
         Self {
             state: Arc::new(RwLock::new(HashMap::new())),
+            runtime: Arc::new(RwLock::new(HashMap::new())),
             config: Arc::new(config),
         }
     }
@@ -173,8 +198,17 @@ impl CircuitBreakerHandle {
         self.state.read().await.clone()
     }
 
-    /// Access the raw shared state (e.g. to pass to the axum middleware layer).
+    /// Access the raw file-based shared state (e.g. to pass to the axum middleware).
     pub fn shared_state(&self) -> SharedState {
         self.state.clone()
+    }
+
+    /// Access the in-process runtime state (e.g. to pass to the axum middleware).
+    ///
+    /// Pass this alongside [`shared_state`](Self::shared_state) to
+    /// [`circuit_breaker_layer`](crate::middleware::circuit_breaker_layer) to
+    /// enable in-process failure detection and half-open probing.
+    pub fn runtime_state(&self) -> RuntimeState {
+        self.runtime.clone()
     }
 }

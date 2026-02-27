@@ -97,8 +97,8 @@ if handle.is_tripped("db").await { /* reject request with 503 */ }
 | HMAC integrity on state file | ✅ | ❌ | ❌ | ❌ |
 | Fail-open on tamper | ✅ | n/a | n/a | n/a |
 | External producer (cron/sidecar) | ✅ | ❌ | ❌ | ❌ |
-| In-process failure detection | ❌ | ✅ | ✅ | ❌ |
-| Automatic half-open probing | ❌ | ✅ | ❌ | ❌ |
+| In-process failure detection | ✅ | ✅ | ✅ | ❌ |
+| Automatic half-open probing | ✅ | ✅ | ❌ | ❌ |
 | Axum / Tower middleware | ✅ | ❌ | ✅ | ✅ |
 | Per-service granularity | ✅ | ✅ | ❌ | ❌ |
 | Constant-time MAC comparison | ✅ | n/a | n/a | n/a |
@@ -195,7 +195,9 @@ Example canonical form for the HMAC input:
  └─────────────────────────────────────────────────────────┘
 ```
 
-## State Machine
+## State Machines
+
+### File-based (written by external health-check producer)
 
 ```text
                        pass
@@ -203,14 +205,41 @@ Example canonical form for the HMAC input:
 │  Closed  │────────►│ Open │─────────────────►│ Tripped │
 │ (normal) │         │      │                  │(blocked)│
 └──────────┘         └──┬───┘                  └────┬────┘
-     ▲                  │ pass                       │ pass
+     ▲                  │ pass                       │ pass (next health cycle)
      └──────────────────┴───────────────────────────┘
 ```
 
 - **Closed** — normal operation; all requests pass through.
-- **Open** — one or more failures below the threshold; requests still pass.
+- **Open** — failures below threshold; requests still pass.
 - **Tripped** — consecutive failures ≥ threshold; requests get `503`.
-- **Unknown** — `is_tripped()` returns `false`; untracked services are never blocked.
+
+### In-process runtime (managed by the axum middleware)
+
+```text
+              fail×threshold          half_open_timeout
+┌──────────┐ ──────────────► ┌─────────┐ ──────────────► ┌──────────┐
+│  Closed  │                 │ Tripped │                  │ HalfOpen │
+│ (normal) │ ◄────────────── │(blocked)│ ◄─────────────── │ (1 probe)│
+└──────────┘     recover     └─────────┘   probe failed   └────┬─────┘
+     ▲                                                          │ probe ok
+     └──────────────────────────────────────────────────────────┘
+```
+
+The middleware watches every response: `threshold` consecutive 5xx replies trip the
+circuit immediately — no waiting for the next health-check run.  After
+`half_open_timeout` one probe is allowed through:
+
+- **Probe succeeds** → circuit closes, normal traffic resumes.
+- **Probe fails** → circuit stays tripped, cooldown restarts.
+
+If a probe request is cancelled mid-flight (client disconnect) the probe slot is
+automatically freed after another `half_open_timeout` so the next request can claim it.
+
+> **Both layers are independent.** Either one alone can block a request with `503`.
+> The external producer handles planned downtime; the in-process detector catches
+> transient failures between health-check cycles.
+
+- **Unknown service** — `is_tripped()` returns `false`; untracked services are never blocked.
 
 ## The Bypass Header
 
@@ -230,10 +259,10 @@ health-check process sends this header; end-user requests never include it.
 
 ```toml
 [dependencies]
-hmac-circuit-breaker = "0.1"
+hmac-circuit-breaker = "0.2"
 
 # With axum middleware:
-hmac-circuit-breaker = { version = "0.1", features = ["axum"] }
+hmac-circuit-breaker = { version = "0.2", features = ["axum"] }
 ```
 
 ## Quick Start
@@ -329,7 +358,12 @@ async fn main() {
 
     let app = Router::new()
         .route("/encrypt/:service", post(my_handler))
-        .layer(circuit_breaker_layer(handle.shared_state(), config, extractor));
+        .layer(circuit_breaker_layer(
+            handle.shared_state(),
+            handle.runtime_state(),
+            config,
+            extractor,
+        ));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     axum::serve(listener, app).await.unwrap();
@@ -346,9 +380,11 @@ Only `state_file` and `secret` need to be set in production.
 |---|---|---|
 | `state_file` | `"circuit_breaker.json"` | Path to the on-disk JSON state file |
 | `secret` | `"circuit-breaker-integrity"` | **Override in production** — HMAC signing secret |
-| `threshold` | `3` | Consecutive failures before a circuit trips |
+| `threshold` | `3` | Consecutive failures before a circuit trips (file-based and in-process) |
 | `reload_interval` | `60s` | How often the background task reloads from disk |
 | `bypass_header` | `"x-health-check-bypass"` | Header that bypasses tripped circuits; `None` disables bypass |
+| `half_open_timeout` | `30s` | Cooldown before a half-open probe is allowed after in-process trip |
+| `success_threshold` | `1` | Consecutive successful probes needed to close the in-process circuit |
 
 ```rust
 // Minimal production config

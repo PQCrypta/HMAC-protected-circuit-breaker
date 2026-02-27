@@ -1,6 +1,6 @@
 [package]
 name = "hmac-circuit-breaker"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["PQCrypta <allan@pqcrypta.com>"]
 description = "HMAC-protected circuit breaker with fail-open semantics. Persists circuit state to disk and verifies integrity with HMAC-SHA256 on every reload to prevent state-file tampering from inducing self-DoS."
@@ -36,6 +36,7 @@ tower  = { version = "0.4", optional = true }
 tokio    = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
 tracing-subscriber = "0.3"
+tower    = { version = "0.4" }
 
 [[example]]
 name = "basic"

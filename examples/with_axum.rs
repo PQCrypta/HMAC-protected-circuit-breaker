@@ -77,6 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/decrypt/:service", get(handler))
         .layer(circuit_breaker_layer(
             handle.shared_state(),
+            handle.runtime_state(),
             config,
             extractor,
         ));

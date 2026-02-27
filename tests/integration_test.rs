@@ -10,6 +10,267 @@ use std::time::Duration;
 use tempfile::tempdir;
 use tokio::sync::RwLock;
 
+// ── Helpers shared by the in-process middleware tests ────────────────────────
+
+#[cfg(feature = "axum")]
+mod middleware_tests {
+    use super::*;
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+        response::{IntoResponse, Response},
+    };
+    use hmac_circuit_breaker::middleware::circuit_breaker_layer;
+    use std::{
+        convert::Infallible,
+        sync::{Arc, Mutex},
+        task::{Context, Poll},
+    };
+    use tower::{Layer, Service};
+
+    /// A minimal tower service that returns a configurable HTTP status code.
+    /// Clones share the same `Arc<Mutex<StatusCode>>` so the code can be
+    /// changed between requests.
+    #[derive(Clone)]
+    struct FixedStatusService(Arc<Mutex<StatusCode>>);
+
+    impl FixedStatusService {
+        fn new(code: StatusCode) -> Self {
+            Self(Arc::new(Mutex::new(code)))
+        }
+        fn set(&self, code: StatusCode) {
+            *self.0.lock().unwrap() = code;
+        }
+    }
+
+    impl Service<Request<Body>> for FixedStatusService {
+        type Response = Response;
+        type Error = Infallible;
+        type Future = std::future::Ready<Result<Response, Infallible>>;
+
+        fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
+            Poll::Ready(Ok(()))
+        }
+        fn call(&mut self, _: Request<Body>) -> Self::Future {
+            let code = *self.0.lock().unwrap();
+            std::future::ready(Ok(code.into_response()))
+        }
+    }
+
+    fn make_req(path: &str) -> Request<Body> {
+        Request::builder().uri(path).body(Body::empty()).unwrap()
+    }
+
+    /// Poll the service ready, then call it.  Avoids depending on `ServiceExt`
+    /// (which has conflicting impls from the two tower versions in the dep graph).
+    async fn call<S>(svc: &mut S, req: Request<Body>) -> Response
+    where
+        S: Service<Request<Body>, Response = Response, Error = Infallible>,
+    {
+        std::future::poll_fn(|cx| svc.poll_ready(cx)).await.unwrap();
+        svc.call(req).await.unwrap()
+    }
+
+    fn cfg(threshold: u32, half_open_ms: u64) -> CircuitBreakerConfig {
+        CircuitBreakerConfig::builder()
+            .state_file("/tmp/nonexistent_cb.json".into())
+            .threshold(threshold)
+            .half_open_timeout(Duration::from_millis(half_open_ms))
+            .success_threshold(1)
+            .build()
+    }
+
+    // ── Tests ─────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn in_process_trips_after_threshold() {
+        let config = cfg(2, 5000);
+        let handle = CircuitBreakerHandle::new(config.clone());
+        let backend = FixedStatusService::new(StatusCode::INTERNAL_SERVER_ERROR);
+        let extractor = |p: &str| -> Option<String> {
+            p.trim_start_matches('/')
+                .split('/')
+                .next()
+                .map(String::from)
+        };
+
+        let mut svc = circuit_breaker_layer(
+            handle.shared_state(),
+            handle.runtime_state(),
+            config,
+            extractor,
+        )
+        .layer(backend);
+
+        // First failure — below threshold, inner response passes through.
+        let r1 = call(&mut svc, make_req("/svc")).await;
+        assert_eq!(r1.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        // Second failure — reaches threshold; response still from inner but
+        // circuit is now tripped for the *next* request.
+        let r2 = call(&mut svc, make_req("/svc")).await;
+        assert_eq!(r2.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        // Third request — circuit is tripped, middleware rejects it.
+        let r3 = call(&mut svc, make_req("/svc")).await;
+        assert_eq!(r3.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn success_resets_failure_counter() {
+        let config = cfg(3, 5000);
+        let handle = CircuitBreakerHandle::new(config.clone());
+        let backend = FixedStatusService::new(StatusCode::INTERNAL_SERVER_ERROR);
+        let extractor = |p: &str| -> Option<String> {
+            p.trim_start_matches('/')
+                .split('/')
+                .next()
+                .map(String::from)
+        };
+
+        let mut svc = circuit_breaker_layer(
+            handle.shared_state(),
+            handle.runtime_state(),
+            config,
+            extractor,
+        )
+        .layer(backend.clone());
+
+        // Two failures (threshold = 3) — circuit stays closed.
+        call(&mut svc, make_req("/svc")).await;
+        call(&mut svc, make_req("/svc")).await;
+
+        // One success — resets the failure counter.
+        backend.set(StatusCode::OK);
+        call(&mut svc, make_req("/svc")).await;
+
+        // Two more failures should NOT trip (counter was reset to 0).
+        backend.set(StatusCode::INTERNAL_SERVER_ERROR);
+        call(&mut svc, make_req("/svc")).await;
+        call(&mut svc, make_req("/svc")).await;
+
+        // Still open — one more failure would trip (3rd in a row), but we
+        // confirm we're not blocked yet.
+        let r = call(&mut svc, make_req("/svc")).await;
+        assert_eq!(
+            r.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Should still be passing through on the 2nd failure after reset"
+        );
+    }
+
+    #[tokio::test]
+    async fn half_open_probe_recovers_circuit() {
+        let config = cfg(1, 5); // trip on first failure; 5 ms cooldown
+        let handle = CircuitBreakerHandle::new(config.clone());
+        let backend = FixedStatusService::new(StatusCode::INTERNAL_SERVER_ERROR);
+        let extractor = |p: &str| -> Option<String> {
+            p.trim_start_matches('/')
+                .split('/')
+                .next()
+                .map(String::from)
+        };
+
+        let mut svc = circuit_breaker_layer(
+            handle.shared_state(),
+            handle.runtime_state(),
+            config,
+            extractor,
+        )
+        .layer(backend.clone());
+
+        // Trip the circuit.
+        call(&mut svc, make_req("/svc")).await;
+
+        // Immediately blocked.
+        let blocked = call(&mut svc, make_req("/svc")).await;
+        assert_eq!(blocked.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // Wait for half-open cooldown.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Switch backend to healthy.
+        backend.set(StatusCode::OK);
+
+        // Probe passes through and succeeds.
+        let probe = call(&mut svc, make_req("/svc")).await;
+        assert_eq!(probe.status(), StatusCode::OK);
+
+        // Circuit is now closed — normal traffic passes.
+        let normal = call(&mut svc, make_req("/svc")).await;
+        assert_eq!(normal.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn half_open_probe_failure_retrips_circuit() {
+        let config = cfg(1, 5);
+        let handle = CircuitBreakerHandle::new(config.clone());
+        let backend = FixedStatusService::new(StatusCode::INTERNAL_SERVER_ERROR);
+        let extractor = |p: &str| -> Option<String> {
+            p.trim_start_matches('/')
+                .split('/')
+                .next()
+                .map(String::from)
+        };
+
+        let mut svc = circuit_breaker_layer(
+            handle.shared_state(),
+            handle.runtime_state(),
+            config,
+            extractor,
+        )
+        .layer(backend.clone());
+
+        // Trip.
+        call(&mut svc, make_req("/svc")).await;
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Probe — still returns 500, so circuit re-trips.
+        let probe = call(&mut svc, make_req("/svc")).await;
+        assert_eq!(
+            probe.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Probe itself passes through even though it fails"
+        );
+
+        // Circuit is tripped again — next request is blocked.
+        let blocked = call(&mut svc, make_req("/svc")).await;
+        assert_eq!(blocked.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn per_service_isolation() {
+        let config = cfg(1, 5000);
+        let handle = CircuitBreakerHandle::new(config.clone());
+        let backend = FixedStatusService::new(StatusCode::INTERNAL_SERVER_ERROR);
+        let extractor = |p: &str| -> Option<String> {
+            p.trim_start_matches('/')
+                .split('/')
+                .next()
+                .map(String::from)
+        };
+
+        let mut svc = circuit_breaker_layer(
+            handle.shared_state(),
+            handle.runtime_state(),
+            config,
+            extractor,
+        )
+        .layer(backend.clone());
+
+        // Trip circuit for "alpha".
+        call(&mut svc, make_req("/alpha")).await;
+        let blocked = call(&mut svc, make_req("/alpha")).await;
+        assert_eq!(blocked.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // "beta" is on a healthy path — should not be affected.
+        backend.set(StatusCode::OK);
+        let ok = call(&mut svc, make_req("/beta")).await;
+        assert_eq!(ok.status(), StatusCode::OK);
+    }
+}
+
 fn config_for(path: &std::path::Path) -> CircuitBreakerConfig {
     CircuitBreakerConfig::builder()
         .state_file(path.to_path_buf())
