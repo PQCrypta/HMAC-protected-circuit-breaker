@@ -17,7 +17,7 @@ default = ["reload"]
 # Enables the background tokio reload task (spawn_reload)
 reload = ["dep:tokio"]
 # Enables the optional axum middleware layer
-axum = ["dep:axum", "reload"]
+axum = ["dep:axum", "dep:tower", "reload"]
 
 [dependencies]
 hmac      = "0.12"
@@ -30,6 +30,7 @@ tracing   = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 tokio  = { version = "1", features = ["time", "fs", "sync", "rt"], optional = true }
 axum   = { version = "0.7", optional = true }
+tower  = { version = "0.4", optional = true }
 
 [dev-dependencies]
 tokio    = { version = "1", features = ["full", "test-util"] }

@@ -22,8 +22,8 @@ type HmacSha256 = Hmac<Sha256>;
 /// assert_eq!(mac.len(), 64); // 32 bytes → 64 hex chars
 /// ```
 pub fn compute_hmac(algorithms_json: &str, secret: &str) -> String {
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-        .expect("HMAC accepts keys of any length");
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts keys of any length");
     mac.update(algorithms_json.as_bytes());
     let result = mac.finalize().into_bytes();
     result.iter().map(|b| format!("{b:02x}")).collect()
@@ -66,7 +66,10 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 #[cfg(test)]

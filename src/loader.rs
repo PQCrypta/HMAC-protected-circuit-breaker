@@ -41,9 +41,7 @@ pub async fn load_into(state: &SharedState, config: &Arc<CircuitBreakerConfig>) 
     };
 
     let hmac_ok = match &cb_file.integrity_hash {
-        Some(expected) => {
-            crate::integrity::verify_file_hmac(&content, expected, &config.secret)
-        }
+        Some(expected) => crate::integrity::verify_file_hmac(&content, expected, &config.secret),
         None => {
             // Legacy file without HMAC — accept it.
             debug!("Circuit breaker state file has no integrity_hash; accepting (legacy mode)");

@@ -36,7 +36,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     ];
 
-    write_state(&state_file, &observations, &BTreeMap::new(), 3, "example-secret")?;
+    write_state(
+        &state_file,
+        &observations,
+        &BTreeMap::new(),
+        3,
+        "example-secret",
+    )?;
     println!("Wrote state to {state_file:?}");
 
     // ── Consumer side ────────────────────────────────────────────────────────
@@ -69,7 +75,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Simulate two more failures for auth, then write again to trip it
-    let mut prev = handle.snapshot().await.into_iter().collect::<BTreeMap<_, _>>();
+    let mut prev = handle
+        .snapshot()
+        .await
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
 
     // Give auth 2 more failures (prev had 1, threshold is 3 → trip at 3rd)
     let obs2 = vec![ServiceObservation {

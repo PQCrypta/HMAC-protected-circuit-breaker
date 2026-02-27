@@ -64,10 +64,12 @@ async fn hmac_mismatch_clears_state() {
 
     // Load with wrong secret — HMAC mismatch → fail-open → state cleared
     let config = Arc::new(config_for(&path));
-    let bad_config = Arc::new(CircuitBreakerConfig::builder()
-        .state_file(path.clone())
-        .secret("wrong-secret")
-        .build());
+    let bad_config = Arc::new(
+        CircuitBreakerConfig::builder()
+            .state_file(path.clone())
+            .secret("wrong-secret")
+            .build(),
+    );
 
     load_into(&state, &bad_config).await;
 
@@ -127,7 +129,10 @@ async fn circuit_trips_after_threshold() {
     }];
     write_state(&path, &obs, &BTreeMap::new(), 2, &config.secret).unwrap();
     handle.load().await;
-    assert!(!handle.is_tripped("svc").await, "Should not trip on first failure");
+    assert!(
+        !handle.is_tripped("svc").await,
+        "Should not trip on first failure"
+    );
 
     // Second failure (2/2 = threshold) — should trip
     let prev = handle.snapshot().await.into_iter().collect();
@@ -144,7 +149,10 @@ async fn circuit_trips_after_threshold() {
     }];
     write_state(&path, &recovery, &prev2, 2, &config.secret).unwrap();
     handle.load().await;
-    assert!(!handle.is_tripped("svc").await, "Should close after recovery");
+    assert!(
+        !handle.is_tripped("svc").await,
+        "Should close after recovery"
+    );
 }
 
 #[tokio::test]
