@@ -196,8 +196,7 @@ where
                             let expected = expected_secret.as_bytes();
                             let actual = header_value.as_bytes();
                             // Constant-time comparison — prevents timing oracle on secret value.
-                            actual.len() == expected.len()
-                                && bool::from(actual.ct_eq(expected))
+                            actual.len() == expected.len() && bool::from(actual.ct_eq(expected))
                         }
                         None => true, // Presence-only (legacy/no-secret mode).
                     };
