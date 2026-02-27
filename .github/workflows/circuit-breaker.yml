@@ -6,7 +6,6 @@ on:
       - "v[0-9]+.[0-9]+.[0-9]+"
   workflow_dispatch:
 
-# Required for crates.io OIDC trusted publishing — no stored API token needed.
 permissions:
   contents: read
   id-token: write
@@ -31,5 +30,28 @@ jobs:
             target/
           key: ${{ runner.os }}-cargo-publish-${{ hashFiles('**/Cargo.lock') }}
 
+      - name: Exchange GitHub OIDC token for crates.io token
+        id: crates-io-token
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const oidcToken = await core.getIDToken('crates.io');
+            const response = await fetch('https://crates.io/api/v1/trusted_publishing/tokens', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+              },
+              body: JSON.stringify({ oidc_token: oidcToken }),
+            });
+            const json = await response.json();
+            if (!response.ok) {
+              throw new Error(`crates.io token exchange failed (${response.status}): ${JSON.stringify(json)}`);
+            }
+            core.setSecret(json.token);
+            core.setOutput('token', json.token);
+
       - name: Publish hmac-circuit-breaker
         run: cargo publish --features axum
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-token.outputs.token }}
