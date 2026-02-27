@@ -103,6 +103,7 @@ use std::{
     task::{Context, Poll},
     time::Instant,
 };
+use subtle::ConstantTimeEq;
 use tower::{Layer, Service};
 use tracing::{info, warn};
 
@@ -184,10 +185,25 @@ where
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
-            // ── Bypass header — always pass through ──────────────────────────
+            // ── Bypass header check ──────────────────────────────────────────
+            // The header name must be present.  When `bypass_header_secret` is
+            // configured the header value must also match (constant-time), so
+            // that an attacker who learns the header *name* cannot bypass circuits.
             if let Some(ref header_name) = config.bypass_header {
-                if request.headers().contains_key(header_name.as_str()) {
-                    return inner.call(request).await;
+                if let Some(header_value) = request.headers().get(header_name.as_str()) {
+                    let bypass_allowed = match &config.bypass_header_secret {
+                        Some(expected_secret) => {
+                            let expected = expected_secret.as_bytes();
+                            let actual = header_value.as_bytes();
+                            // Constant-time comparison — prevents timing oracle on secret value.
+                            actual.len() == expected.len()
+                                && bool::from(actual.ct_eq(expected))
+                        }
+                        None => true, // Presence-only (legacy/no-secret mode).
+                    };
+                    if bypass_allowed {
+                        return inner.call(request).await;
+                    }
                 }
             }
 
@@ -348,6 +364,11 @@ where
                     } else {
                         rt.consecutive_failures += 1;
                         rt.consecutive_successes = 0;
+                        // Defensive reset: probe_in_flight should only be true in
+                        // HalfOpen state, but guard against any stale value so that
+                        // a Closed→Tripped transition doesn't leave the probe slot
+                        // permanently occupied.
+                        rt.probe_in_flight = false;
 
                         if rt.consecutive_failures >= config.threshold {
                             rt.status = RuntimeStatus::Tripped;

@@ -65,7 +65,7 @@ let handle = CircuitBreakerHandle::new(
     CircuitBreakerConfig::builder().state_file(path.into()).secret("my-secret").build()
 );
 handle.load().await;
-handle.spawn_reload(); // background reload every 60 s
+let _reload = handle.spawn_reload(); // background reload every 60 s (returns JoinHandle)
 
 if handle.is_tripped("db").await { /* reject request with 503 */ }
 ```
@@ -94,12 +94,14 @@ if handle.is_tripped("db").await { /* reject request with 503 */ }
 - **Automatic half-open probing** — after a configurable cooldown, one probe request is allowed through; success closes the circuit, failure restarts the cooldown.
 - **HMAC-protected persistence** — circuit state is written to disk with an embedded HMAC-SHA256 tag; every reload verifies the tag before trusting any state.
 - **Fail-open on tamper** — a bad HMAC clears all in-memory state rather than tripping every circuit; an attacker with write access can at most temporarily remove protection, not weaponise it.
-- **Atomic file writes** — state is written to a `.tmp` file and renamed into place; readers never see a partial write.
-- **Constant-time MAC comparison** — the HMAC tag is compared with an XOR-fold; no early exit, no timing oracle.
+- **Atomic file writes** — state is written to a `.tmp` sibling file and renamed into place (same directory to guarantee same-filesystem atomic rename); readers never see a partial write.
+- **Constant-time MAC comparison** — HMAC tags are compared using the audited `subtle` crate (`ConstantTimeEq`); no early exit, no timing oracle.
 - **External producer model** — a separate health-check process (cron, sidecar, etc.) writes the state file; the API server only reads it.
 - **Per-service granularity** — each named service has independent circuit state; one tripped service does not affect others.
 - **Axum / Tower middleware** — drop-in `circuit_breaker_layer` wraps any axum `Router` with zero boilerplate.
-- **Bypass header** — a configurable header lets the health-check cron re-probe tripped services without deadlocking.
+- **Bypass header with secret** — a configurable header (and optional secret value) lets the health-check cron re-probe tripped services without deadlocking; the secret prevents bypass via header-name disclosure.
+- **Strict HMAC mode** — optionally reject legacy unsigned files once all producers have been upgraded.
+- **Graceful shutdown** — `spawn_reload()` returns a `JoinHandle` so the background task can be aborted on shutdown.
 
 ---
 
@@ -110,13 +112,15 @@ These properties are explicitly enforced by the implementation:
 | Guarantee | How it is implemented |
 |---|---|
 | **HMAC is deterministic across languages** | Both writer and verifier round-trip through `serde_json::Value` (BTreeMap-backed), producing alphabetically sorted keys at every nesting level — not just the outer map |
-| **State file writes are atomic** | Writer outputs to `{path}.json.tmp` then calls `rename(2)` — readers never observe a partial write |
-| **HMAC comparison is constant-time** | Custom `constant_time_eq` XOR-folds the byte slices; no early exit |
+| **State file writes are atomic** | Writer outputs to `{path}.json.tmp` (same directory) then calls `rename(2)` — readers never observe a partial write; cross-filesystem rename (EXDEV) returns `WriteError::AtomicRename` |
+| **HMAC comparison is constant-time** | Uses `subtle::ConstantTimeEq` from the audited RustCrypto `subtle` crate; no early exit |
 | **Tampered file fails open, not closed** | HMAC mismatch clears all in-memory state; no circuit is left tripped from a forged file |
 | **Unknown services are open by default** | `is_tripped()` returns `false` for any name not in the state file; new services are never accidentally blocked |
 | **First-run safe** | Missing state file is silently ignored; all circuits begin closed |
-| **Legacy files are accepted** | Files without `integrity_hash` are loaded without HMAC verification for backward compatibility |
+| **Legacy files emit a warning** | Files without `integrity_hash` log at `WARN`; enable `strict_hmac` to reject them entirely |
 | **In-memory reads are lock-free contention-minimal** | State is `Arc<RwLock<HashMap>>` — concurrent reads never block each other |
+| **Default secret triggers a warning** | `CircuitBreakerConfigBuilder::build()` emits `tracing::warn!` if the secret is still the built-in default |
+| **Bypass header requires a secret in production** | Configure `bypass_header_secret` so that knowing the header name alone is not sufficient to bypass circuits |
 
 ---
 
@@ -247,7 +251,7 @@ echo "integrity_hash: $HASH"
  │    • Extract service name from URL path                 │
  │    • File state Tripped  → 503 immediately              │
  │    • Runtime state Tripped → 503 immediately            │
- │    • bypass header → always pass through (health cron)  │
+ │    • bypass header + secret → pass through (health cron)│
  └─────────────────────────────────────────────────────────┘
 ```
 
@@ -306,8 +310,23 @@ a bypass, tripped circuits create a deadlock:
 circuit tripped → health check blocked → circuit never resets → deadlock forever
 ```
 
-The bypass header (default: `x-health-check-bypass`) lets the cron through. Only the
-health-check process sends this header; end-user requests never include it.
+The bypass header (default: `x-health-check-bypass`) lets the cron through. In
+production, always configure `bypass_header_secret` so that knowing the header name
+alone is insufficient to bypass circuit protection:
+
+```rust
+let config = CircuitBreakerConfig::builder()
+    .bypass_header(Some("x-health-check-bypass"))
+    .bypass_header_secret(Some(
+        std::env::var("BYPASS_SECRET").expect("BYPASS_SECRET must be set")
+    ))
+    .build();
+```
+
+The secret is compared in constant time. Without `bypass_header_secret`, the bypass
+falls back to presence-only (any request that includes the header is let through),
+which is acceptable in fully private internal networks but not over public or shared
+infrastructure.
 
 ---
 
@@ -315,10 +334,10 @@ health-check process sends this header; end-user requests never include it.
 
 ```toml
 [dependencies]
-hmac-circuit-breaker = "0.2"
+hmac-circuit-breaker = "0.3"
 
 # With axum middleware:
-hmac-circuit-breaker = { version = "0.2", features = ["axum"] }
+hmac-circuit-breaker = { version = "0.3", features = ["axum"] }
 ```
 
 ## Quick Start
@@ -335,7 +354,7 @@ use std::path::Path;
 
 fn run_health_checks() -> Result<(), Box<dyn std::error::Error>> {
     let path = Path::new("/var/run/myapp/circuit_breaker.json");
-    let secret = std::env::var("HMAC_SECRET").unwrap_or_default();
+    let secret = std::env::var("HMAC_SECRET").expect("HMAC_SECRET must be set");
 
     // Load previous state to accumulate consecutive failure counts.
     // Safe on first run — returns empty map if file doesn't exist yet.
@@ -367,14 +386,14 @@ use std::time::Duration;
 async fn main() {
     let config = CircuitBreakerConfig::builder()
         .state_file(PathBuf::from("/var/run/myapp/circuit_breaker.json"))
-        .secret(std::env::var("HMAC_SECRET").unwrap_or_default())
+        .secret(std::env::var("HMAC_SECRET").expect("HMAC_SECRET must be set"))
         .threshold(3)
         .reload_interval(Duration::from_secs(60))
         .build();
 
     let handle = CircuitBreakerHandle::new(config);
     handle.load().await;    // initial load at startup
-    handle.spawn_reload();  // background refresh
+    let _reload = handle.spawn_reload();  // background refresh; returns JoinHandle
 
     if handle.is_tripped("auth").await { /* return 503 */ }
 
@@ -397,16 +416,22 @@ use axum::{Router, routing::post};
 use hmac_circuit_breaker::{CircuitBreakerConfig, CircuitBreakerHandle};
 use hmac_circuit_breaker::middleware::circuit_breaker_layer;
 
+async fn my_handler() -> &'static str { "ok" }
+
 #[tokio::main]
 async fn main() {
     let config = CircuitBreakerConfig::builder()
         .state_file("/var/run/myapp/circuit_breaker.json".into())
-        .secret(std::env::var("HMAC_SECRET").unwrap_or_default())
+        .secret(std::env::var("HMAC_SECRET").expect("HMAC_SECRET must be set"))
+        // Require a secret value on the bypass header (production best practice)
+        .bypass_header_secret(Some(
+            std::env::var("BYPASS_SECRET").expect("BYPASS_SECRET must be set")
+        ))
         .build();
 
     let handle = CircuitBreakerHandle::new(config.clone());
     handle.load().await;
-    handle.spawn_reload();
+    let _reload = handle.spawn_reload();
 
     // Map "/encrypt/{service}" → service name for circuit lookup
     let extractor = |path: &str| -> Option<String> {
@@ -432,6 +457,25 @@ async fn main() {
 }
 ```
 
+### 4 — Graceful shutdown with JoinHandle
+
+`spawn_reload()` now returns a `tokio::task::JoinHandle<()>` so the background reload
+task can be cleanly stopped during shutdown:
+
+```rust
+let handle = CircuitBreakerHandle::new(config);
+let reload_task = handle.spawn_reload();
+
+// ... run your application ...
+
+// On shutdown signal:
+reload_task.abort();
+let _ = reload_task.await; // JoinError::is_cancelled() is expected
+```
+
+Drop the handle to ignore it — the task continues until the runtime shuts down (same
+behaviour as the previous `()` return type).
+
 ---
 
 ## Configuration Reference
@@ -441,18 +485,24 @@ Only `state_file` and `secret` need to be set in production.
 | Field | Default | Description |
 |---|---|---|
 | `state_file` | `"circuit_breaker.json"` | Path to the on-disk JSON state file |
-| `secret` | `"circuit-breaker-integrity"` | **Override in production** — HMAC signing secret |
+| `secret` | `"circuit-breaker-integrity"` | **Override in production** — HMAC signing secret. A `tracing::warn!` is emitted if the default is used. |
 | `threshold` | `3` | Consecutive failures before a circuit trips (file-based and in-process) |
 | `reload_interval` | `60s` | How often the background task reloads from disk |
 | `bypass_header` | `"x-health-check-bypass"` | Header that bypasses tripped circuits; `None` disables bypass |
+| `bypass_header_secret` | `None` | Required header value for bypass (constant-time compared); `None` = presence-only |
 | `half_open_timeout` | `30s` | Cooldown before a half-open probe is allowed after in-process trip |
 | `success_threshold` | `1` | Consecutive successful probes needed to close the in-process circuit |
+| `strict_hmac` | `false` | When `true`, reject state files without `integrity_hash` (unsigned/legacy files) |
 
 ```rust
 // Minimal production config
 let config = CircuitBreakerConfig::builder()
     .state_file("/var/run/myapp/circuit_breaker.json".into())
     .secret(std::env::var("HMAC_SECRET").expect("HMAC_SECRET must be set"))
+    .bypass_header_secret(Some(
+        std::env::var("BYPASS_SECRET").expect("BYPASS_SECRET must be set")
+    ))
+    .strict_hmac(true)  // reject unsigned files once all producers are upgraded
     .build();
 
 // Disable bypass entirely (e.g. you handle recovery out-of-band)
@@ -488,7 +538,8 @@ let config = CircuitBreakerConfig::builder()
 The service map key is called `"algorithms"` — a naming convention from the original
 use case (per-algorithm circuit protection in a cryptographic API). Any string key
 works; `"algorithms"` is just the JSON field name. `integrity_hash` is absent in
-legacy files, which are accepted without verification for backward compatibility.
+legacy files; when present, it is HMAC-SHA256 over the compact canonical JSON of the
+`algorithms` block, hex-encoded (lowercase, 64 characters).
 
 ---
 
@@ -496,7 +547,7 @@ legacy files, which are accepted without verification for backward compatibility
 
 | Environment | Recommended source |
 |---|---|
-| Development | Hard-coded fallback (convenient, not secure) |
+| Development | Hard-coded fallback (convenient, not secure — `tracing::warn!` emitted) |
 | Production | Database password / service account secret |
 | Multi-tenant | Dedicated secret per tenant in Vault / AWS Secrets Manager |
 
@@ -509,7 +560,7 @@ process that might tamper with the file.
 
 | Feature | Default | Description |
 |---|---|---|
-| `reload` | **yes** | `CircuitBreakerHandle::spawn_reload()` — requires tokio |
+| `reload` | **yes** | `CircuitBreakerHandle::spawn_reload()` — requires tokio; returns `JoinHandle<()>` |
 | `axum` | no | `circuit_breaker_layer()` axum middleware — implies `reload` |
 
 ---
@@ -522,19 +573,29 @@ explicitly in the changelog. The **on-disk JSON state file format** is considere
 stable from `0.1` onward — a breaking change to the format will require a major
 version bump so existing producers and consumers continue to interoperate.
 
+### v0.3.0 changes (this release)
+
+- **`spawn_reload()` now returns `JoinHandle<()>`** — enables graceful shutdown. Drop the handle to preserve the previous "fire and forget" behaviour.
+- **`bypass_header_secret` config field** — optional secret value required on the bypass header (constant-time compared). `None` preserves the previous presence-only behaviour.
+- **`strict_hmac` config field** — when `true`, unsigned legacy files are rejected (fail-open) instead of accepted. Default `false` preserves backward compatibility.
+- **`tracing::warn!` on default secret** — `CircuitBreakerConfigBuilder::build()` warns when the built-in placeholder secret is still in use.
+- **`subtle::ConstantTimeEq` for HMAC comparison** — replaced the inline XOR-fold with the audited `subtle` crate.
+- **`WriteError::AtomicRename`** — cross-filesystem `rename(2)` failures (EXDEV) now surface with a descriptive error variant.
+- **`cargo audit` in CI** — dependency CVE scanning on every push.
+- **GitHub Actions pinned to full commit SHAs** — supply-chain hardening.
+
 ---
 
 ## Security Considerations
 
-- **HMAC key rotation** — update producer and consumer simultaneously. A brief window
-  of mismatch triggers fail-open (circuits cleared), not a crash or outage.
-- **File permissions** — restrict write access to the state file to the health-check
-  process. HMAC is a second line of defence, not a replacement for OS-level ACLs.
-- **Constant-time comparison** — HMAC tags are compared byte-by-byte with XOR folding;
-  no early exit that could leak the tag length via timing.
-- **Atomic writes** — `rename(2)` ensures readers never see a partial file.
-- **Unknown services are fail-open** — newly deployed services are never accidentally
-  blocked before their first health check.
+- **Override the HMAC secret** — `CircuitBreakerConfigBuilder::build()` emits a warning if the built-in default is in use. Always supply a unique secret from an environment variable or secrets manager.
+- **Add a bypass header secret** — configure `bypass_header_secret` so that an attacker who discovers the bypass header name cannot use it to bypass circuit protection.
+- **Enable `strict_hmac`** — once all producers write HMAC-signed files, enable `strict_hmac: true` to reject unsigned legacy files.
+- **HMAC key rotation** — update producer and consumer simultaneously. A brief window of mismatch triggers fail-open (circuits cleared), not a crash or outage.
+- **File permissions** — restrict write access to the state file to the health-check process. HMAC is a second line of defence, not a replacement for OS-level ACLs.
+- **Constant-time comparison** — HMAC tags are compared using `subtle::ConstantTimeEq` from the audited RustCrypto project; no early exit that could leak timing information.
+- **Atomic writes** — `rename(2)` with same-directory temp file ensures readers never see a partial file; cross-device renames return `WriteError::AtomicRename`.
+- **Unknown services are fail-open** — newly deployed services are never accidentally blocked before their first health check.
 - **No state = no block** — missing state file on first run is silently safe.
 
 ---

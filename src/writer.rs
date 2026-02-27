@@ -19,6 +19,14 @@ pub enum WriteError {
     Serialise(#[from] serde_json::Error),
     #[error("Failed to write temp file: {0}")]
     Io(#[from] std::io::Error),
+    /// `rename(2)` failed across filesystem boundaries (EXDEV).
+    ///
+    /// This happens when `path` is on a different mount than its parent
+    /// directory.  Keep `path` on the same filesystem as its parent, or
+    /// configure the state file path so the `.tmp` sibling can be renamed
+    /// atomically.
+    #[error("Atomic rename failed (cross-device?): {0}")]
+    AtomicRename(std::io::Error),
 }
 
 /// Input for a single service's health observation.
@@ -141,9 +149,26 @@ pub fn write_state(
     let pretty = serde_json::to_string_pretty(&file)?;
 
     // Write to a temp file first, then atomically rename.
+    //
+    // The temp file is placed in the same directory as `path` (same inode
+    // namespace) so that `rename(2)` is always an atomic same-filesystem
+    // operation.  Do NOT redirect the temp file to a different mount point
+    // (e.g. /tmp) — that would cause rename to fail with EXDEV (OS error 18
+    // on POSIX), which is surfaced as `WriteError::AtomicRename`.
     let tmp_path = path.with_extension("json.tmp");
     std::fs::write(&tmp_path, &pretty)?;
-    std::fs::rename(&tmp_path, path)?;
+
+    // EXDEV (errno 18 on POSIX): rename crosses filesystem boundaries.
+    // This cannot happen when both tmp and destination share the same parent
+    // directory, but guard against misconfiguration with a descriptive error.
+    std::fs::rename(&tmp_path, path).map_err(|e| {
+        // raw_os_error() == Some(18) is EXDEV on Linux and macOS.
+        if e.raw_os_error() == Some(18) {
+            WriteError::AtomicRename(e)
+        } else {
+            WriteError::Io(e)
+        }
+    })?;
 
     Ok(())
 }

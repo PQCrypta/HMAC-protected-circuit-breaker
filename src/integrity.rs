@@ -7,6 +7,7 @@
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use subtle::ConstantTimeEq;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -37,6 +38,10 @@ pub fn compute_hmac(algorithms_json: &str, secret: &str) -> String {
 /// * `false` – HMAC invalid or JSON cannot be parsed (treat as tampered).
 ///
 /// Note: if `raw_json` contains no `algorithms` key this returns `false`.
+///
+/// The comparison is performed over the hex-encoded MAC strings (matching the
+/// on-disk representation) using a constant-time comparator from the `subtle`
+/// crate to resist timing side-channels.
 pub fn verify_file_hmac(raw_json: &str, expected_hex: &str, secret: &str) -> bool {
     let root: serde_json::Value = match serde_json::from_str(raw_json) {
         Ok(v) => v,
@@ -57,19 +62,18 @@ pub fn verify_file_hmac(raw_json: &str, expected_hex: &str, secret: &str) -> boo
 
     let computed = compute_hmac(&algorithms_json, secret);
 
-    // Constant-time comparison to resist timing side-channels.
-    constant_time_eq(computed.as_bytes(), expected_hex.as_bytes())
-}
+    // Constant-time comparison using the audited `subtle` crate.
+    // Both sides are hex strings of equal length (64 chars) when the MAC is valid;
+    // the length check is performed outside the constant-time path to avoid leaking
+    // information beyond what is already encoded in the length itself.
+    let computed_bytes = computed.as_bytes();
+    let expected_bytes = expected_hex.as_bytes();
 
-/// Constant-time byte-slice equality.  Returns `true` iff `a == b`.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
+    if computed_bytes.len() != expected_bytes.len() {
         return false;
     }
-    a.iter()
-        .zip(b.iter())
-        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-        == 0
+
+    computed_bytes.ct_eq(expected_bytes).into()
 }
 
 #[cfg(test)]
@@ -112,9 +116,14 @@ mod tests {
     }
 
     #[test]
-    fn constant_time_eq_works() {
-        assert!(constant_time_eq(b"abc", b"abc"));
-        assert!(!constant_time_eq(b"abc", b"abd"));
-        assert!(!constant_time_eq(b"ab", b"abc"));
+    fn constant_time_comparison_works() {
+        // Same MAC → valid
+        let json = r#"{"svc":{"consecutive_failures":0,"status":"closed"}}"#;
+        let mac = compute_hmac(json, "secret");
+        let computed_bytes = mac.as_bytes();
+        assert!(bool::from(computed_bytes.ct_eq(computed_bytes)));
+
+        // Different length → invalid (length check)
+        assert!(!bool::from(b"abc".ct_eq(b"abcd")));
     }
 }

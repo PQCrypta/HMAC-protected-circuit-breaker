@@ -11,11 +11,12 @@ use tracing::{debug, warn};
 ///
 /// # HMAC behaviour
 ///
-/// | `integrity_hash` in file | Result |
-/// |---|---|
-/// | Present and valid | State is loaded normally |
-/// | Present but **invalid** | State is **cleared** (fail-open); `WARN` emitted |
-/// | Absent (legacy file) | State is loaded (backward-compatible) |
+/// | `integrity_hash` in file | `strict_hmac` | Result |
+/// |---|---|---|
+/// | Present and valid | any | State is loaded normally |
+/// | Present but **invalid** | any | State is **cleared** (fail-open); `WARN` emitted |
+/// | Absent (legacy file) | `false` | State is loaded; `WARN` emitted |
+/// | Absent (legacy file) | `true` | State is **cleared** (fail-open); `WARN` emitted |
 ///
 /// File-not-found is silently ignored (first-run case).  All other I/O errors are
 /// logged at `WARN`.
@@ -43,9 +44,20 @@ pub async fn load_into(state: &SharedState, config: &Arc<CircuitBreakerConfig>) 
     let hmac_ok = match &cb_file.integrity_hash {
         Some(expected) => crate::integrity::verify_file_hmac(&content, expected, &config.secret),
         None => {
-            // Legacy file without HMAC — accept it.
-            debug!("Circuit breaker state file has no integrity_hash; accepting (legacy mode)");
-            true
+            // Legacy file without HMAC.
+            if config.strict_hmac {
+                warn!(
+                    "Circuit breaker state file has no integrity_hash and strict_hmac is enabled \
+                     — clearing all circuits (fail-open) to prevent accepting an unsigned file."
+                );
+                false
+            } else {
+                warn!(
+                    "Circuit breaker state file has no integrity_hash; accepting without \
+                     verification (legacy mode). Enable strict_hmac to reject unsigned files."
+                );
+                true
+            }
         }
     };
 

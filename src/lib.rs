@@ -164,9 +164,27 @@ impl CircuitBreakerHandle {
     /// Spawn a background tokio task that calls [`load`](Self::load) every
     /// `config.reload_interval`.
     ///
-    /// The task runs until the last clone of this handle is dropped.
+    /// Returns the [`tokio::task::JoinHandle`] so callers can await or abort
+    /// the reload task on shutdown.  The handle can be safely dropped — the
+    /// task will continue running until the tokio runtime shuts down.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use hmac_circuit_breaker::{CircuitBreakerConfig, CircuitBreakerHandle};
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let handle = CircuitBreakerHandle::new(CircuitBreakerConfig::default());
+    /// let reload_task = handle.spawn_reload();
+    ///
+    /// // ... run application ...
+    ///
+    /// // Graceful shutdown: stop the reload task.
+    /// reload_task.abort();
+    /// # }
+    /// ```
     #[cfg(feature = "reload")]
-    pub fn spawn_reload(&self) {
+    pub fn spawn_reload(&self) -> tokio::task::JoinHandle<()> {
         let state = self.state.clone();
         let config = self.config.clone();
         tokio::spawn(async move {
@@ -174,7 +192,7 @@ impl CircuitBreakerHandle {
                 loader::load_into(&state, &config).await;
                 tokio::time::sleep(config.reload_interval).await;
             }
-        });
+        })
     }
 
     /// Returns `true` if the named service has been tripped (consecutive failures ≥
