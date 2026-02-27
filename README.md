@@ -91,20 +91,22 @@ if handle.is_tripped("db").await { /* reject request with 503 */ }
 
 ## Feature comparison
 
-| Feature | hmac-circuit-breaker | [`failsafe`](https://crates.io/crates/failsafe) | [`tower-retry`](https://docs.rs/tower/latest/tower/retry/) | [`tower-limit`](https://docs.rs/tower/latest/tower/limit/) |
-|---|:---:|:---:|:---:|:---:|
-| Persists state across restarts | ✅ | ❌ | ❌ | ❌ |
-| HMAC integrity on state file | ✅ | ❌ | ❌ | ❌ |
-| Fail-open on tamper | ✅ | n/a | n/a | n/a |
-| External producer (cron/sidecar) | ✅ | ❌ | ❌ | ❌ |
-| In-process failure detection | ✅ | ✅ | ✅ | ❌ |
-| Automatic half-open probing | ✅ | ✅ | ❌ | ❌ |
-| Axum / Tower middleware | ✅ | ❌ | ✅ | ✅ |
-| Per-service granularity | ✅ | ✅ | ❌ | ❌ |
-| Constant-time MAC comparison | ✅ | n/a | n/a | n/a |
+`tower-retry` (retry logic) and `tower-limit` (concurrency/rate limiting) solve
+different problems from circuit breaking and are not meaningful to compare here.
+The relevant comparison is against [`failsafe`](https://crates.io/crates/failsafe),
+the other Rust circuit breaker crate:
 
-`tower-retry` and `tower-limit` are complementary — use them together for in-process
-retry and rate limiting, and `hmac-circuit-breaker` for cross-restart integrity.
+| Feature | hmac-circuit-breaker | `failsafe` |
+|---|:---:|:---:|
+| In-process failure detection | ✅ | ✅ |
+| Automatic half-open probing | ✅ | ✅ |
+| Axum / Tower middleware | ✅ | ❌ |
+| Per-service granularity | ✅ | ✅ |
+| Persists state across restarts | ✅ | ❌ |
+| HMAC integrity on state file | ✅ | ❌ |
+| Fail-open on tamper | ✅ | ❌ |
+| External producer (cron/sidecar) | ✅ | ❌ |
+| Constant-time MAC comparison | ✅ | ❌ |
 
 ---
 
