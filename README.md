@@ -1,7 +1,9 @@
 # hmac-circuit-breaker
 
-> An HMAC-protected circuit breaker with **fail-open semantics** for service resilience.
+> A **focused, security-aware** circuit breaker for Rust — HMAC-protected on-disk state
+> with fail-open semantics. Designed for systems where the state file cannot be trusted.
 
+[![CI](https://github.com/PQCrypta/HMAC-protected-circuit-breaker/actions/workflows/ci.yml/badge.svg)](https://github.com/PQCrypta/HMAC-protected-circuit-breaker/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/hmac-circuit-breaker.svg)](https://crates.io/crates/hmac-circuit-breaker)
 [![docs.rs](https://img.shields.io/docsrs/hmac-circuit-breaker)](https://docs.rs/hmac-circuit-breaker)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -17,37 +19,55 @@ state to disk to survive reboots — but none of them ask the question:
 > *What happens if someone writes a plausible-looking state file with every circuit
 > "tripped"?*
 
-This crate answers that. It adds **HMAC-SHA256 integrity** to the on-disk state and
-makes a deliberate architectural choice about what to do when the check fails: it
+This crate is the answer. It adds **HMAC-SHA256 integrity** to the on-disk state and
+makes a deliberate, security-first choice about what to do when the check fails: it
 **fails open** (clears all circuits) rather than failing closed (blocking all traffic).
 
-That single decision — fail-open on tamper, not fail-closed — prevents an attacker from
-weaponising the circuit breaker as a denial-of-service amplifier.
+That single decision — fail-open on tamper, not fail-closed — prevents an attacker
+from weaponising the circuit breaker as a denial-of-service amplifier.
+
+**Scope:** This is a focused security tool, not a general-purpose circuit breaker
+framework. It does one thing: verify that the state file your health-check process
+writes hasn't been tampered with, and enforce that state at the request boundary.
 
 Designed for:
 - Security-sensitive services where the circuit state file is on shared or
   world-writable storage
-- Systems with a separate health-check process that writes state (monitoring daemon,
-  cron job, sidecar)
-- Axum-based APIs that need per-service circuit enforcement as a middleware layer
+- Systems with a separate health-check process that writes state (cron job,
+  monitoring daemon, sidecar)
+- Axum-based APIs that need per-service circuit enforcement as a `tower::Layer`
+- Environments where a self-DoS via state-file manipulation is a credible threat
 
 ---
 
-## Hello World
+## Hello World: the complete loop in ~10 lines
 
 ```rust
-use hmac_circuit_breaker::{CircuitBreakerConfig, CircuitBreakerHandle};
+use hmac_circuit_breaker::{
+    CircuitBreakerConfig, CircuitBreakerHandle,
+    writer::{write_state, ServiceObservation},
+    state::CircuitBreakerFile,
+};
+use std::{collections::BTreeMap, path::Path};
 
-#[tokio::main]
-async fn main() {
-    let handle = CircuitBreakerHandle::new(CircuitBreakerConfig::default());
-    handle.load().await;       // load state file once at startup
-    handle.spawn_reload();     // reload in background every 60 s
+// ── Producer (health-check cron) ──────────────────────────────────────────────
+let path = Path::new("/run/app/cb.json");
+let prev = std::fs::read_to_string(path).ok()
+    .and_then(|s| serde_json::from_str::<CircuitBreakerFile>(&s).ok())
+    .map(|f| f.algorithms).unwrap_or_default();
 
-    if handle.is_tripped("payments").await {
-        eprintln!("payments circuit is open — skipping");
-    }
-}
+write_state(path, &[
+    ServiceObservation { name: "db".into(), passed: false, error: Some("timeout".into()) },
+], &prev, 3, "my-secret")?;
+
+// ── Consumer (API server) ─────────────────────────────────────────────────────
+let handle = CircuitBreakerHandle::new(
+    CircuitBreakerConfig::builder().state_file(path.into()).secret("my-secret").build()
+);
+handle.load().await;
+handle.spawn_reload(); // background reload every 60 s
+
+if handle.is_tripped("db").await { /* reject request with 503 */ }
 ```
 
 ---
@@ -55,16 +75,53 @@ async fn main() {
 ## When to use this crate
 
 **Use it when:**
-- A separate process (cron, monitoring daemon) observes service health and writes
-  results to a shared file — and you can't trust the file won't be tampered with
-- You need the circuit state to survive application restarts
-- You're running on Axum and want circuit enforcement as a `tower::Layer`
+- A separate process observes service health and writes results to a shared file,
+  and you cannot trust that file won't be tampered with
+- You need circuit state to survive application restarts
+- You're on Axum and want per-service circuit enforcement as a middleware layer
+- You need cryptographic proof that your circuit state hasn't been forged
 
 **Skip it when:**
-- Your circuit breaker only needs in-process, in-memory state (use
-  [`failsafe`](https://crates.io/crates/failsafe) or similar)
-- The producer and consumer are the same process and share memory directly
-- You don't need per-service granularity
+- Your circuit breaker needs in-process, in-memory detection only — use
+  [`failsafe`](https://crates.io/crates/failsafe) instead
+- The producer and consumer are the same process sharing memory directly
+- You need automatic in-process failure detection (half-open probing, etc.)
+
+---
+
+## Feature comparison
+
+| Feature | hmac-circuit-breaker | [`failsafe`](https://crates.io/crates/failsafe) | [`tower-retry`](https://docs.rs/tower/latest/tower/retry/) | [`tower-limit`](https://docs.rs/tower/latest/tower/limit/) |
+|---|:---:|:---:|:---:|:---:|
+| Persists state across restarts | ✅ | ❌ | ❌ | ❌ |
+| HMAC integrity on state file | ✅ | ❌ | ❌ | ❌ |
+| Fail-open on tamper | ✅ | n/a | n/a | n/a |
+| External producer (cron/sidecar) | ✅ | ❌ | ❌ | ❌ |
+| In-process failure detection | ❌ | ✅ | ✅ | ❌ |
+| Automatic half-open probing | ❌ | ✅ | ❌ | ❌ |
+| Axum / Tower middleware | ✅ | ❌ | ✅ | ✅ |
+| Per-service granularity | ✅ | ✅ | ❌ | ❌ |
+| Constant-time MAC comparison | ✅ | n/a | n/a | n/a |
+
+`tower-retry` and `tower-limit` are complementary — use them together for in-process
+retry and rate limiting, and `hmac-circuit-breaker` for cross-restart integrity.
+
+---
+
+## Design guarantees
+
+These properties are explicitly enforced by the implementation:
+
+| Guarantee | How it is implemented |
+|---|---|
+| **HMAC is deterministic across languages** | Both writer and verifier round-trip through `serde_json::Value` (BTreeMap-backed), producing alphabetically sorted keys at every nesting level — not just the outer map |
+| **State file writes are atomic** | Writer outputs to `{path}.json.tmp` then calls `rename(2)` — readers never observe a partial write |
+| **HMAC comparison is constant-time** | Custom `constant_time_eq` XOR-folds the byte slices; no early exit |
+| **Tampered file fails open, not closed** | HMAC mismatch clears all in-memory state; no circuit is left tripped from a forged file |
+| **Unknown services are open by default** | `is_tripped()` returns `false` for any name not in the state file; new services are never accidentally blocked |
+| **First-run safe** | Missing state file is silently ignored; all circuits begin closed |
+| **Legacy files are accepted** | Files without `integrity_hash` are loaded without HMAC verification for backward compatibility |
+| **In-memory reads are lock-free contention-minimal** | State is `Arc<RwLock<HashMap>>` — concurrent reads never block each other |
 
 ---
 
@@ -72,48 +129,42 @@ async fn main() {
 
 A circuit breaker that only lives in memory resets on every restart — useful for
 transient faults but blind to persistent failures that survive reboots. Persisting
-circuit state to disk solves that, but it introduces a new attack surface:
+circuit state to disk solves that, but introduces a new attack surface:
 
-> **If an adversary can write to the state file, they can trip every circuit — causing
-> a denial-of-service without ever touching the services themselves.**
-
-## The Solution
-
-This crate computes **HMAC-SHA256** over the circuit state map and embeds the tag in
-the state file. On every reload the tag is verified before the state is trusted.
+> **If an adversary can write to the state file, they can trip every circuit — a
+> denial-of-service without ever touching the services themselves.**
 
 ### Why Fail-Open on HMAC Mismatch?
-
-The natural instinct is to fail-closed when integrity breaks: "invalid file → block
-everything." That instinct is wrong here. Consider what each choice gives an attacker:
 
 | Response to tampered file | What the attacker achieves |
 |---|---|
 | **Fail-closed** — block all traffic | Full self-DoS. Attacker writes a plausible-but-MAC-invalid file; every circuit trips immediately. |
-| **Fail-open** — clear all circuits | Temporary removal of circuit protection for one reload cycle. Worst case is the baseline behaviour *without* a circuit breaker. |
+| **Fail-open** — clear all circuits | Temporary removal of protection for one reload cycle. Worst case is baseline behaviour *without* a circuit breaker. |
 
-Fail-open means the attacker can at most *remove* protection for ~60 seconds — and the
-tamper attempt is logged as a `WARN`. They cannot **weaponise** the circuit breaker to
-block legitimate traffic.
+Fail-open means an attacker can at most *remove* protection for ~60 seconds — and the
+tamper attempt is logged as a `WARN`. They cannot **weaponise** the circuit breaker.
 
-The HMAC secret should be sourced from the same credential store as the service (e.g.
-the database password), so an attacker who can write the file but not read secrets
-still cannot forge a valid tag.
+The HMAC secret should come from the same credential store as the service (e.g. the
+database password), so a process that can write the file but not read secrets cannot
+forge a valid tag.
 
-### Canonical JSON: Why It Matters for Producers
+### Canonical JSON: The Cross-Language Contract
 
-The HMAC is computed over the **compact JSON of the `algorithms` map**. To get a
-stable byte string both the writer and verifier round-trip the map through
-`serde_json::Value` before serialising. This matters because:
+The HMAC input is the **compact, alphabetically sorted JSON of the `algorithms` map**.
+This is the contract any third-party producer must follow:
 
-- A Rust struct serialises fields in **declaration order** (e.g. `status` before
-  `consecutive_failures`)
-- `serde_json::Value` uses `BTreeMap` at **every level**, so all keys are sorted
-  **alphabetically** regardless of how the struct was declared
+```
+Sort all JSON object keys alphabetically at every nesting level.
+Compact serialisation (no whitespace).
+UTF-8 encoding.
+HMAC-SHA256 with the shared secret.
+Hex-encode the output (lowercase).
+```
 
-Both sides must use the same canonical form. If you're implementing a third-party
-producer in another language, sort all JSON object keys alphabetically at every
-nesting level before computing the HMAC.
+Example canonical form for the HMAC input:
+```json
+{"auth":{"consecutive_failures":1,"reason":"timeout","status":"open"},"db":{"consecutive_failures":0,"status":"closed"}}
+```
 
 ---
 
@@ -125,7 +176,7 @@ nesting level before computing the HMAC.
  │                                                         │
  │  1. Probe each service                                  │
  │  2. Load previous state from disk (accumulate failures) │
- │  3. Compute HMAC-SHA256 over sorted-key algorithms JSON │
+ │  3. Sort algorithms map, compact-serialise, HMAC-SHA256 │
  │  4. Write circuit_breaker.json atomically (tmp + rename)│
  └────────────────────────┬────────────────────────────────┘
                           │  on-disk JSON
@@ -138,7 +189,7 @@ nesting level before computing the HMAC.
  │                                                         │
  │  Per-request middleware:                                 │
  │    • Extract service name from URL                      │
- │    • Check status in memory (O(1) read)                 │
+ │    • Check status in memory (O(1) read, no contention)  │
  │    • If Tripped → 503; otherwise → pass through         │
  │    • bypass header → always pass through (health cron)  │
  └─────────────────────────────────────────────────────────┘
@@ -156,26 +207,22 @@ nesting level before computing the HMAC.
      └──────────────────┴───────────────────────────┘
 ```
 
-- **Closed** — normal operation; requests pass through.
-- **Open** — one or more failures below the threshold; requests still pass but the
-  service is considered degraded.
-- **Tripped** — consecutive failures reached the threshold; requests receive
-  `503 Service Unavailable` until a health check passes.
-- **Unknown service** — `is_tripped()` returns `false` for any service not in the
-  state file. This is intentional: fail-open is the default for untracked services.
+- **Closed** — normal operation; all requests pass through.
+- **Open** — one or more failures below the threshold; requests still pass.
+- **Tripped** — consecutive failures ≥ threshold; requests get `503`.
+- **Unknown** — `is_tripped()` returns `false`; untracked services are never blocked.
 
 ## The Bypass Header
 
-The health-check cron that writes the state file also needs to *read* through it.
-Without a bypass, tripped circuits create a deadlock:
+The health-check cron needs to re-probe tripped services to confirm recovery. Without
+a bypass, tripped circuits create a deadlock:
 
 ```
-circuit tripped → health check blocked → circuit never resets → deadlock
+circuit tripped → health check blocked → circuit never resets → deadlock forever
 ```
 
-The bypass header (default: `x-health-check-bypass`) lets the cron re-probe tripped
-services. Only the health-check process sends this header; end-user requests never
-include it.
+The bypass header (default: `x-health-check-bypass`) lets the cron through. Only the
+health-check process sends this header; end-user requests never include it.
 
 ---
 
@@ -193,10 +240,6 @@ hmac-circuit-breaker = { version = "0.1", features = ["axum"] }
 
 ### 1 — Health-check producer (writes state file)
 
-The producer runs as a separate process (cron job, sidecar, etc.). It needs the
-previous state to accumulate consecutive failure counts correctly. Read it from the
-same file using `CircuitBreakerFile`:
-
 ```rust
 use hmac_circuit_breaker::{
     state::CircuitBreakerFile,
@@ -210,14 +253,13 @@ fn run_health_checks() -> Result<(), Box<dyn std::error::Error>> {
     let secret = std::env::var("HMAC_SECRET").unwrap_or_default();
 
     // Load previous state to accumulate consecutive failure counts.
-    // Returns empty map on first run or if the file doesn't exist yet.
+    // Safe on first run — returns empty map if file doesn't exist yet.
     let previous: BTreeMap<_, _> = std::fs::read_to_string(path)
         .ok()
         .and_then(|s| serde_json::from_str::<CircuitBreakerFile>(&s).ok())
         .map(|f| f.algorithms)
         .unwrap_or_default();
 
-    // Results of probing your services
     let observations = vec![
         ServiceObservation { name: "payments".into(), passed: true,  error: None },
         ServiceObservation { name: "auth".into(),     passed: false,
@@ -247,14 +289,10 @@ async fn main() {
 
     let handle = CircuitBreakerHandle::new(config);
     handle.load().await;    // initial load at startup
-    handle.spawn_reload();  // background refresh every 60 s
+    handle.spawn_reload();  // background refresh
 
-    // Before dispatching to a service:
-    if handle.is_tripped("auth").await {
-        // return 503 — circuit is tripped
-    }
+    if handle.is_tripped("auth").await { /* return 503 */ }
 
-    // Full state inspection:
     if let Some(state) = handle.get("payments").await {
         println!("{}: {} failures", state.status, state.consecutive_failures);
     }
@@ -279,7 +317,7 @@ async fn main() {
     handle.load().await;
     handle.spawn_reload();
 
-    // Map "/encrypt/{service}" → service name
+    // Map "/encrypt/{service}" → service name for circuit lookup
     let extractor = |path: &str| -> Option<String> {
         let parts: Vec<&str> = path.trim_start_matches('/').splitn(3, '/').collect();
         if parts.first() == Some(&"encrypt") {
@@ -302,8 +340,7 @@ async fn main() {
 
 ## Configuration Reference
 
-All fields have sensible defaults — only `state_file` and `secret` need to be set in
-production.
+Only `state_file` and `secret` need to be set in production.
 
 | Field | Default | Description |
 |---|---|---|
@@ -311,7 +348,7 @@ production.
 | `secret` | `"circuit-breaker-integrity"` | **Override in production** — HMAC signing secret |
 | `threshold` | `3` | Consecutive failures before a circuit trips |
 | `reload_interval` | `60s` | How often the background task reloads from disk |
-| `bypass_header` | `"x-health-check-bypass"` | Request header that bypasses tripped circuits; set to `None` to disable |
+| `bypass_header` | `"x-health-check-bypass"` | Header that bypasses tripped circuits; `None` disables bypass |
 
 ```rust
 // Minimal production config
@@ -320,7 +357,7 @@ let config = CircuitBreakerConfig::builder()
     .secret(std::env::var("HMAC_SECRET").expect("HMAC_SECRET must be set"))
     .build();
 
-// Disable the bypass header entirely
+// Disable bypass entirely (e.g. you handle recovery out-of-band)
 let config = CircuitBreakerConfig::builder()
     .bypass_header(None::<&str>)
     .build();
@@ -350,14 +387,10 @@ let config = CircuitBreakerConfig::builder()
 }
 ```
 
-Note that the service map key is called `"algorithms"` — a naming convention from the
-original use case (per-algorithm circuit protection in a cryptographic API). The crate
-accepts any string key; `"algorithms"` is just the field name in the JSON schema.
-
-`integrity_hash` is HMAC-SHA256 of the **compact, alphabetically sorted JSON of the
-`algorithms` map**. Keys at every nesting level are sorted because the crate uses
-`serde_json::Value` (BTreeMap-backed) rather than the struct serialiser. Files without
-`integrity_hash` are accepted for backward compatibility with legacy producers.
+The service map key is called `"algorithms"` — a naming convention from the original
+use case (per-algorithm circuit protection in a cryptographic API). Any string key
+works; `"algorithms"` is just the JSON field name. `integrity_hash` is absent in
+legacy files, which are accepted without verification for backward compatibility.
 
 ---
 
@@ -365,13 +398,12 @@ accepts any string key; `"algorithms"` is just the field name in the JSON schema
 
 | Environment | Recommended source |
 |---|---|
-| Development | Hard-coded fallback string (not secure, but convenient) |
-| Production | Database password / service account secret — same process boundary as the app |
-| Multi-service | Dedicated secret in Vault / AWS Secrets Manager |
+| Development | Hard-coded fallback (convenient, not secure) |
+| Production | Database password / service account secret |
+| Multi-tenant | Dedicated secret per tenant in Vault / AWS Secrets Manager |
 
-The goal is that a process that can write the state file (but cannot read application
-secrets) cannot forge a valid HMAC. The secret does not need to be high-entropy — it
-just needs to be **unavailable to the attacker** who might tamper with the file.
+The secret does not need to be high-entropy — it just needs to be unavailable to the
+process that might tamper with the file.
 
 ---
 
@@ -384,42 +416,45 @@ just needs to be **unavailable to the attacker** who might tamper with the file.
 
 ---
 
+## Versioning and stability
+
+This crate follows [Semantic Versioning](https://semver.org). Releases in the `0.x`
+series may include breaking API changes; every breaking change will be called out
+explicitly in the changelog. The **on-disk JSON state file format** is considered
+stable from `0.1` onward — a breaking change to the format will require a major
+version bump so existing producers and consumers continue to interoperate.
+
+---
+
 ## Security Considerations
 
-- **HMAC key rotation** — update the health-check producer and API consumer
-  simultaneously. A brief window where the file has an old HMAC and the consumer
-  has a new secret triggers fail-open (state cleared), not a crash.
+- **HMAC key rotation** — update producer and consumer simultaneously. A brief window
+  of mismatch triggers fail-open (circuits cleared), not a crash or outage.
 - **File permissions** — restrict write access to the state file to the health-check
-  process. The HMAC is a second line of defence, not a replacement for OS-level ACLs.
-- **Constant-time comparison** — HMAC tags are compared with a constant-time function
-  to prevent timing side-channels.
-- **Atomic writes** — the writer uses a temp-file + `rename` pattern so readers never
-  observe a partial write.
-- **Unknown services are fail-open** — `is_tripped()` returns `false` for any service
-  not present in the state file. Newly deployed services are never accidentally blocked.
-- **No state = no block** — if the state file doesn't exist yet (first run), all
-  circuits are treated as closed. The background task silently waits for the file to
-  appear.
+  process. HMAC is a second line of defence, not a replacement for OS-level ACLs.
+- **Constant-time comparison** — HMAC tags are compared byte-by-byte with XOR folding;
+  no early exit that could leak the tag length via timing.
+- **Atomic writes** — `rename(2)` ensures readers never see a partial file.
+- **Unknown services are fail-open** — newly deployed services are never accidentally
+  blocked before their first health check.
+- **No state = no block** — missing state file on first run is silently safe.
 
 ---
 
 ## Running the Examples
 
 ```bash
-# Producer + consumer round-trip
+# Complete producer + consumer round-trip
 cargo run --example basic
 
-# axum middleware (needs the axum feature)
+# axum middleware demo
 cargo run --example with_axum --features axum
 ```
 
 ## Running Tests
 
 ```bash
-# All unit + integration + doc tests
 cargo test
-
-# Include axum middleware tests
 cargo test --features axum
 ```
 
