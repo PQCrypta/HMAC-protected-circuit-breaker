@@ -1,11 +1,34 @@
-//! Axum middleware that rejects requests to tripped services with `503 Service Unavailable`.
+//! Axum/Tower middleware that enforces circuit breaker state per request.
 //!
 //! Enable with the `axum` Cargo feature.
 //!
-//! # How service names are resolved
+//! ## Two layers of protection
 //!
-//! The middleware needs to map an incoming request URL to a service name tracked in the
-//! circuit breaker state.  It does this via a user-supplied **extractor function**:
+//! The middleware checks two independent state maps on every request:
+//!
+//! 1. **File-based state** (`SharedState`) — written by an external health-check
+//!    producer and reloaded from disk periodically.  Reflects the producer's view
+//!    of each service.
+//!
+//! 2. **In-process runtime state** (`RuntimeState`) — managed entirely by this
+//!    middleware.  Trips immediately when the **current process** observes
+//!    `threshold` consecutive 5xx responses, without waiting for the next
+//!    health-check cycle.
+//!
+//! If either layer says a service is tripped, the request is rejected with
+//! `503 Service Unavailable`.
+//!
+//! ## Half-open probing
+//!
+//! After the in-process circuit trips, it enters a cooldown.  Once
+//! `half_open_timeout` elapses, exactly one probe request is allowed through:
+//!
+//! * **Probe succeeds** → circuit closes; normal traffic resumes.
+//! * **Probe fails** → circuit stays tripped; cooldown restarts.
+//!
+//! ## How service names are resolved
+//!
+//! Supply a **extractor function** that maps a request path to a service name:
 //!
 //! ```rust,ignore
 //! fn my_extractor(path: &str) -> Option<String> {
@@ -14,16 +37,13 @@
 //! }
 //! ```
 //!
-//! Pass this function (or closure) to [`circuit_breaker_layer`].
-//!
-//! # Bypass header
+//! ## Bypass header
 //!
 //! Requests containing the configured bypass header are always passed through,
 //! even to tripped services.  This allows health-check processes to re-probe a
-//! tripped service and confirm recovery.  Without the bypass, a tripped circuit
-//! creates a deadlock: the circuit blocks the probe that would reset it.
+//! tripped service and confirm recovery.
 //!
-//! # Example
+//! ## Example
 //!
 //! ```rust,no_run
 //! use axum::{Router, routing::post};
@@ -44,7 +64,6 @@
 //!     handle.load().await;
 //!     handle.spawn_reload();
 //!
-//!     // Map "/encrypt/{service}" → "{service}"
 //!     let extractor = |path: &str| -> Option<String> {
 //!         let segs: Vec<&str> = path.trim_start_matches('/').splitn(3, '/').collect();
 //!         if segs.first() == Some(&"encrypt") { segs.get(1).map(|s| s.to_string()) }
@@ -53,14 +72,23 @@
 //!
 //!     let app = Router::new()
 //!         .route("/encrypt/:service", post(encrypt))
-//!         .layer(circuit_breaker_layer(handle.shared_state(), config, extractor));
+//!         .layer(circuit_breaker_layer(
+//!             handle.shared_state(),
+//!             handle.runtime_state(),
+//!             config,
+//!             extractor,
+//!         ));
 //!
 //!     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
 //!     axum::serve(listener, app).await.unwrap();
 //! }
 //! ```
 
-use crate::{config::CircuitBreakerConfig, state::CircuitStatus, SharedState};
+use crate::{
+    config::CircuitBreakerConfig,
+    state::{CircuitStatus, RuntimeServiceState, RuntimeStatus},
+    RuntimeState, SharedState,
+};
 use axum::{
     body::Body,
     http::{Request, StatusCode},
@@ -73,17 +101,21 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
+    time::Instant,
 };
 use tower::{Layer, Service};
-use tracing::warn;
+use tracing::{info, warn};
+
+// ── Layer ─────────────────────────────────────────────────────────────────────
 
 /// Tower [`Layer`] returned by [`circuit_breaker_layer`].
 ///
-/// Wraps any inner service that handles `Request<Body>` and injects circuit
-/// breaker enforcement before the inner service is called.
+/// Wraps any inner service with circuit-breaker enforcement — both file-based
+/// and in-process runtime state are checked before forwarding each request.
 #[derive(Clone)]
 pub struct CircuitBreakerLayer<F> {
     state: SharedState,
+    runtime: RuntimeState,
     config: Arc<CircuitBreakerConfig>,
     extractor: Arc<F>,
 }
@@ -104,20 +136,23 @@ where
         CircuitBreakerService {
             inner,
             state: self.state.clone(),
+            runtime: self.runtime.clone(),
             config: self.config.clone(),
             extractor: self.extractor.clone(),
         }
     }
 }
 
+// ── Service ───────────────────────────────────────────────────────────────────
+
 /// Tower [`Service`] produced by [`CircuitBreakerLayer`].
 ///
-/// Checks the circuit breaker state for each request before forwarding to the
-/// inner service, short-circuiting with a `503` when the circuit is tripped.
+/// Enforces both file-based and in-process circuit state on every request.
 #[derive(Clone)]
 pub struct CircuitBreakerService<F, S> {
     inner: S,
     state: SharedState,
+    runtime: RuntimeState,
     config: Arc<CircuitBreakerConfig>,
     extractor: Arc<F>,
 }
@@ -139,15 +174,17 @@ where
     }
 
     fn call(&mut self, request: Request<Body>) -> Self::Future {
-        let state = self.state.clone();
+        let file_state = self.state.clone();
+        let runtime = self.runtime.clone();
         let config = self.config.clone();
         let extractor = self.extractor.clone();
-        // Clone inner so the original `self.inner` stays ready for the next call
-        // (tower contract: call must not be invoked again until poll_ready returns Ok).
+        // Clone inner before the async block so `self` stays ready for the
+        // next call (Tower contract: `call` must not be invoked again until
+        // `poll_ready` returns `Ok`).
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
-            // Allow health-check bypass to pass through tripped circuits
+            // ── Bypass header — always pass through ──────────────────────────
             if let Some(ref header_name) = config.bypass_header {
                 if request.headers().contains_key(header_name.as_str()) {
                     return inner.call(request).await;
@@ -155,27 +192,32 @@ where
             }
 
             let path = request.uri().path().to_string();
+            let service_name = match extractor(&path) {
+                Some(s) => s,
+                None => return inner.call(request).await,
+            };
 
-            if let Some(service_name) = extractor(&path) {
-                let guard = state.read().await;
-                if let Some(svc_state) = guard.get(&service_name) {
-                    if svc_state.status == CircuitStatus::Tripped {
-                        let reason = svc_state
+            // ── File-based circuit check ─────────────────────────────────────
+            {
+                let guard = file_state.read().await;
+                if let Some(svc) = guard.get(&service_name) {
+                    if svc.status == CircuitStatus::Tripped {
+                        let reason = svc
                             .reason
                             .clone()
                             .unwrap_or_else(|| "Consecutive health check failures".to_string());
-                        let since = svc_state.since.clone().unwrap_or_default();
-                        let failures = svc_state.consecutive_failures;
-                        drop(guard); // release read lock before returning
+                        let since = svc.since.clone().unwrap_or_default();
+                        let failures = svc.consecutive_failures;
+                        drop(guard);
 
                         warn!(
                             service = %service_name,
                             failures = failures,
                             since = %since,
-                            "Circuit breaker TRIPPED — rejecting request"
+                            "Circuit breaker (file-based) TRIPPED — rejecting request"
                         );
 
-                        let response = (
+                        return Ok((
                             StatusCode::SERVICE_UNAVAILABLE,
                             Json(json!({
                                 "error": "service_unavailable",
@@ -187,32 +229,182 @@ where
                                 "consecutive_failures": failures,
                                 "tripped_since": since,
                                 "reason": reason,
-                                "retry_after": "Check back after the next health cycle"
+                                "retry_after": "Check back after the next health cycle",
                             })),
                         )
-                        .into_response();
-
-                        return Ok(response);
+                            .into_response());
                     }
                 }
             }
 
-            inner.call(request).await
+            // ── In-process runtime circuit check ────────────────────────────
+            let is_probe;
+            {
+                let mut guard = runtime.write().await;
+                let rt = guard
+                    .entry(service_name.clone())
+                    .or_insert_with(RuntimeServiceState::default);
+
+                match rt.status {
+                    RuntimeStatus::Closed => {
+                        is_probe = false;
+                    }
+                    RuntimeStatus::Tripped => {
+                        let elapsed = rt
+                            .tripped_at
+                            .map(|t| t.elapsed())
+                            .unwrap_or(std::time::Duration::MAX);
+
+                        if elapsed >= config.half_open_timeout {
+                            // Cooldown elapsed → enter half-open, send this request as probe
+                            rt.status = RuntimeStatus::HalfOpen;
+                            rt.probe_in_flight = true;
+                            rt.probe_started_at = Some(Instant::now());
+                            is_probe = true;
+                        } else {
+                            // Still cooling down → reject
+                            drop(guard);
+                            warn!(
+                                service = %service_name,
+                                "Circuit breaker (in-process) TRIPPED — rejecting request"
+                            );
+                            return Ok((
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                Json(json!({
+                                    "error": "service_unavailable",
+                                    "message": format!(
+                                        "Service '{}' circuit is tripped; retry after cooldown",
+                                        service_name
+                                    ),
+                                    "service": service_name,
+                                    "source": "in_process",
+                                    "retry_after": "Check back after the cooldown period",
+                                })),
+                            )
+                                .into_response());
+                        }
+                    }
+                    RuntimeStatus::HalfOpen => {
+                        // Allow a probe only when none is in flight (or the
+                        // in-flight probe has been running longer than the
+                        // half-open timeout, indicating a dropped connection).
+                        let probe_stale = rt
+                            .probe_started_at
+                            .map(|t| t.elapsed() >= config.half_open_timeout)
+                            .unwrap_or(true);
+
+                        if rt.probe_in_flight && !probe_stale {
+                            // Another probe is already in flight → reject
+                            drop(guard);
+                            return Ok((
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                Json(json!({
+                                    "error": "service_unavailable",
+                                    "message": format!(
+                                        "Service '{}' circuit is half-open; probe already in flight",
+                                        service_name
+                                    ),
+                                    "service": service_name,
+                                    "source": "in_process",
+                                    "retry_after": "Check back after the probe completes",
+                                })),
+                            )
+                                .into_response());
+                        }
+
+                        // Allow through as probe
+                        rt.probe_in_flight = true;
+                        rt.probe_started_at = Some(Instant::now());
+                        is_probe = true;
+                    }
+                }
+            }
+
+            // ── Forward to inner service ─────────────────────────────────────
+            let response = inner.call(request).await?;
+            let status = response.status();
+
+            // ── Update in-process runtime state based on response ────────────
+            {
+                let mut guard = runtime.write().await;
+                let rt = guard
+                    .entry(service_name.clone())
+                    .or_insert_with(RuntimeServiceState::default);
+
+                if status.is_server_error() {
+                    if is_probe {
+                        // Probe failed → re-trip the circuit
+                        rt.status = RuntimeStatus::Tripped;
+                        rt.consecutive_failures = 1;
+                        rt.consecutive_successes = 0;
+                        rt.tripped_at = Some(Instant::now());
+                        rt.probe_in_flight = false;
+                        rt.probe_started_at = None;
+
+                        warn!(
+                            service = %service_name,
+                            "Half-open probe failed — circuit (in-process) re-tripped"
+                        );
+                    } else {
+                        rt.consecutive_failures += 1;
+                        rt.consecutive_successes = 0;
+
+                        if rt.consecutive_failures >= config.threshold {
+                            rt.status = RuntimeStatus::Tripped;
+                            rt.tripped_at = Some(Instant::now());
+
+                            warn!(
+                                service = %service_name,
+                                failures = rt.consecutive_failures,
+                                "Circuit breaker (in-process) tripped after consecutive failures"
+                            );
+                        }
+                    }
+                } else {
+                    // Non-5xx response → success
+                    if is_probe {
+                        rt.consecutive_successes += 1;
+                        if rt.consecutive_successes >= config.success_threshold {
+                            rt.status = RuntimeStatus::Closed;
+                            rt.consecutive_failures = 0;
+                            rt.consecutive_successes = 0;
+                            rt.probe_in_flight = false;
+                            rt.probe_started_at = None;
+
+                            info!(
+                                service = %service_name,
+                                "Circuit breaker (in-process) closed after successful probe"
+                            );
+                        } else {
+                            rt.probe_in_flight = false;
+                            rt.probe_started_at = None;
+                        }
+                    } else {
+                        // Non-probe success resets the failure counter
+                        rt.consecutive_failures = 0;
+                    }
+                }
+            }
+
+            Ok(response)
         })
     }
 }
 
+// ── Constructor ───────────────────────────────────────────────────────────────
+
 /// Create an axum-compatible [`Layer`] that enforces circuit breaker state.
 ///
-/// * `state` – shared in-memory circuit state (from [`CircuitBreakerHandle::shared_state()`]).
-/// * `config` – configuration (bypass header name, etc.).
-/// * `service_extractor` – function that maps a request path to a service name, or `None`
-///   if the path should not be checked.
+/// * `state` – file-based shared state from [`CircuitBreakerHandle::shared_state()`].
+/// * `runtime` – in-process runtime state from [`CircuitBreakerHandle::runtime_state()`].
+/// * `config` – configuration (threshold, bypass header, half-open timeout, etc.).
+/// * `service_extractor` – maps a request path to a service name, or `None` to skip checking.
 ///
 /// Returns a concrete [`CircuitBreakerLayer<F>`] that can be passed directly to
 /// axum's `Router::layer()`.
 pub fn circuit_breaker_layer<F>(
     state: SharedState,
+    runtime: RuntimeState,
     config: CircuitBreakerConfig,
     service_extractor: F,
 ) -> CircuitBreakerLayer<F>
@@ -221,6 +413,7 @@ where
 {
     CircuitBreakerLayer {
         state,
+        runtime,
         config: Arc::new(config),
         extractor: Arc::new(service_extractor),
     }
