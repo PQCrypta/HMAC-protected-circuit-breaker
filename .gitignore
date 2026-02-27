@@ -1,1 +1,3 @@
 /target/
+# Library crates don't commit Cargo.lock — consumers control their own lock file
+Cargo.lock
