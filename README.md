@@ -82,10 +82,9 @@ if handle.is_tripped("db").await { /* reject request with 503 */ }
 - You need cryptographic proof that your circuit state hasn't been forged
 
 **Skip it when:**
-- Your circuit breaker needs in-process, in-memory detection only — use
-  [`failsafe`](https://crates.io/crates/failsafe) instead
+- Your circuit breaker needs in-process, in-memory detection only and you
+  have no shared state file — use [`failsafe`](https://crates.io/crates/failsafe) instead
 - The producer and consumer are the same process sharing memory directly
-- You need automatic in-process failure detection (half-open probing, etc.)
 
 ---
 
@@ -255,7 +254,7 @@ health-check process sends this header; end-user requests never include it.
 
 ```toml
 [dependencies]
-hmac-circuit-breaker = "0.2.1"
+hmac-circuit-breaker = "0.2"
 
 # With axum middleware:
 hmac-circuit-breaker = { version = "0.2", features = ["axum"] }
