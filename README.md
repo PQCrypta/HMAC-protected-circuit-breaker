@@ -89,24 +89,18 @@ if handle.is_tripped("db").await { /* reject request with 503 */ }
 
 ---
 
-## Feature comparison
+## Features
 
-`tower-retry` (retry logic) and `tower-limit` (concurrency/rate limiting) solve
-different problems from circuit breaking and are not meaningful to compare here.
-The relevant comparison is against [`failsafe`](https://crates.io/crates/failsafe),
-the other Rust circuit breaker crate:
-
-| Feature | hmac-circuit-breaker | `failsafe` |
-|---|:---:|:---:|
-| In-process failure detection | ✅ | ✅ |
-| Automatic half-open probing | ✅ | ✅ |
-| Axum / Tower middleware | ✅ | ❌ |
-| Per-service granularity | ✅ | ✅ |
-| Persists state across restarts | ✅ | ❌ |
-| HMAC integrity on state file | ✅ | ❌ |
-| Fail-open on tamper | ✅ | ❌ |
-| External producer (cron/sidecar) | ✅ | ❌ |
-| Constant-time MAC comparison | ✅ | ❌ |
+- **In-process failure detection** — middleware counts consecutive 5xx responses and trips the circuit immediately, without waiting for the next health-check cycle.
+- **Automatic half-open probing** — after a configurable cooldown, one probe request is allowed through; success closes the circuit, failure restarts the cooldown.
+- **HMAC-protected persistence** — circuit state is written to disk with an embedded HMAC-SHA256 tag; every reload verifies the tag before trusting any state.
+- **Fail-open on tamper** — a bad HMAC clears all in-memory state rather than tripping every circuit; an attacker with write access can at most temporarily remove protection, not weaponise it.
+- **Atomic file writes** — state is written to a `.tmp` file and renamed into place; readers never see a partial write.
+- **Constant-time MAC comparison** — the HMAC tag is compared with an XOR-fold; no early exit, no timing oracle.
+- **External producer model** — a separate health-check process (cron, sidecar, etc.) writes the state file; the API server only reads it.
+- **Per-service granularity** — each named service has independent circuit state; one tripped service does not affect others.
+- **Axum / Tower middleware** — drop-in `circuit_breaker_layer` wraps any axum `Router` with zero boilerplate.
+- **Bypass header** — a configurable header lets the health-check cron re-probe tripped services without deadlocking.
 
 ---
 
@@ -261,7 +255,7 @@ health-check process sends this header; end-user requests never include it.
 
 ```toml
 [dependencies]
-hmac-circuit-breaker = "0.2"
+hmac-circuit-breaker = "0.2.1"
 
 # With axum middleware:
 hmac-circuit-breaker = { version = "0.2", features = ["axum"] }
