@@ -41,6 +41,7 @@ jobs:
               headers: {
                 'Content-Type': 'application/json',
                 'Accept': 'application/json',
+                'User-Agent': 'hmac-circuit-breaker/0.2.2 (allan@pqcrypta.com)',
               },
               body: JSON.stringify({ oidc_token: oidcToken }),
             });
