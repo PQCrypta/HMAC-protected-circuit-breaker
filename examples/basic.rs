@@ -2,8 +2,8 @@
 //! consumer handle.
 
 use hmac_circuit_breaker::{
-    writer::{write_state, ServiceObservation},
     CircuitBreakerConfig, CircuitBreakerHandle,
+    writer::{ServiceObservation, write_state},
 };
 use std::collections::BTreeMap;
 use std::path::PathBuf;
