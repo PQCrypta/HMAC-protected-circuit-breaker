@@ -85,9 +85,9 @@
 //! ```
 
 use crate::{
+    RuntimeState, SharedState,
     config::CircuitBreakerConfig,
     state::{CircuitStatus, RuntimeServiceState, RuntimeStatus},
-    RuntimeState, SharedState,
 };
 use axum::{
     body::Body,

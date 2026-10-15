@@ -7,11 +7,11 @@
 //!   curl http://localhost:3000/encrypt/auth       # 503 (tripped)
 //!   curl -H "x-health-check-bypass: 1" http://localhost:3000/encrypt/auth  # bypass → 200
 
-use axum::{routing::get, Router};
+use axum::{Router, routing::get};
 use hmac_circuit_breaker::{
-    middleware::circuit_breaker_layer,
-    writer::{write_state, ServiceObservation},
     CircuitBreakerConfig, CircuitBreakerHandle,
+    middleware::circuit_breaker_layer,
+    writer::{ServiceObservation, write_state},
 };
 use std::collections::BTreeMap;
 use std::path::PathBuf;

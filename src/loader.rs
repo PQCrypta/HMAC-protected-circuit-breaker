@@ -3,7 +3,7 @@
 //! **Fail-open semantics**: if the HMAC integrity check fails, all circuits are cleared
 //! (not blocked) and the failure is logged at `WARN` level.
 
-use crate::{config::CircuitBreakerConfig, state::CircuitBreakerFile, SharedState};
+use crate::{SharedState, config::CircuitBreakerConfig, state::CircuitBreakerFile};
 use std::sync::Arc;
 use tracing::{debug, warn};
 

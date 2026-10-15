@@ -1,8 +1,8 @@
 use hmac_circuit_breaker::{
+    CircuitBreakerConfig, CircuitBreakerHandle,
     loader::load_into,
     state::{CircuitBreakerFile, CircuitStatus},
-    writer::{write_state, ServiceObservation},
-    CircuitBreakerConfig, CircuitBreakerHandle,
+    writer::{ServiceObservation, write_state},
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;

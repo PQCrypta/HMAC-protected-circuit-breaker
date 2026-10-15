@@ -7,7 +7,7 @@
 [![Crates.io](https://img.shields.io/crates/v/hmac-circuit-breaker.svg)](https://crates.io/crates/hmac-circuit-breaker)
 [![docs.rs](https://img.shields.io/docsrs/hmac-circuit-breaker)](https://docs.rs/hmac-circuit-breaker)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.75%2B-blue)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.85%2B-blue)](https://www.rust-lang.org)
 
 ---
 
@@ -334,10 +334,10 @@ infrastructure.
 
 ```toml
 [dependencies]
-hmac-circuit-breaker = "0.3"
+hmac-circuit-breaker = "0.4"
 
 # With axum middleware:
-hmac-circuit-breaker = { version = "0.3", features = ["axum"] }
+hmac-circuit-breaker = { version = "0.4", features = ["axum"] }
 ```
 
 ## Quick Start
@@ -573,7 +573,13 @@ explicitly in the changelog. The **on-disk JSON state file format** is considere
 stable from `0.1` onward — a breaking change to the format will require a major
 version bump so existing producers and consumers continue to interoperate.
 
-### v0.3.0 changes (this release)
+### v0.4.0 changes (this release)
+
+- **axum 0.8 and tower 0.5** — the `axum` feature's `circuit_breaker_layer()` now fits an axum 0.8 `Router`. A layer built against axum 0.7 cannot be added to an 0.8 router (their request body types differ), so applications on axum 0.7 stay on 0.3.
+- **hmac 0.13, sha2 0.11, thiserror 2** — the HMAC-SHA256 tags are byte-for-byte the same, so state files written by 0.3 verify under 0.4 and the reverse.
+- **Edition 2024**, minimum Rust 1.85.
+
+### v0.3.0 changes
 
 - **`spawn_reload()` now returns `JoinHandle<()>`** — enables graceful shutdown. Drop the handle to preserve the previous "fire and forget" behaviour.
 - **`bypass_header_secret` config field** — optional secret value required on the bypass header (constant-time compared). `None` preserves the previous presence-only behaviour.

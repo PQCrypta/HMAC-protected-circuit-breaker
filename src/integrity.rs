@@ -5,7 +5,7 @@
 //! alphabetically, guaranteeing byte-for-byte identical serialisation on every writer
 //! and reader regardless of insertion order.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
@@ -79,6 +79,16 @@ pub fn verify_file_hmac(raw_json: &str, expected_hex: &str, secret: &str) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rfc4231_test_case_2() {
+        // A known answer pins the tag itself, not just agreement with itself:
+        // state files written under one hmac/sha2 release verify under another.
+        assert_eq!(
+            compute_hmac("what do ya want for nothing?", "Jefe"),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
 
     #[test]
     fn round_trip_hmac() {
