@@ -189,20 +189,20 @@ where
             // The header name must be present.  When `bypass_header_secret` is
             // configured the header value must also match (constant-time), so
             // that an attacker who learns the header *name* cannot bypass circuits.
-            if let Some(ref header_name) = config.bypass_header {
-                if let Some(header_value) = request.headers().get(header_name.as_str()) {
-                    let bypass_allowed = match &config.bypass_header_secret {
-                        Some(expected_secret) => {
-                            let expected = expected_secret.as_bytes();
-                            let actual = header_value.as_bytes();
-                            // Constant-time comparison — prevents timing oracle on secret value.
-                            actual.len() == expected.len() && bool::from(actual.ct_eq(expected))
-                        }
-                        None => true, // Presence-only (legacy/no-secret mode).
-                    };
-                    if bypass_allowed {
-                        return inner.call(request).await;
+            if let Some(ref header_name) = config.bypass_header
+                && let Some(header_value) = request.headers().get(header_name.as_str())
+            {
+                let bypass_allowed = match &config.bypass_header_secret {
+                    Some(expected_secret) => {
+                        let expected = expected_secret.as_bytes();
+                        let actual = header_value.as_bytes();
+                        // Constant-time comparison — prevents timing oracle on secret value.
+                        actual.len() == expected.len() && bool::from(actual.ct_eq(expected))
                     }
+                    None => true, // Presence-only (legacy/no-secret mode).
+                };
+                if bypass_allowed {
+                    return inner.call(request).await;
                 }
             }
 
@@ -215,24 +215,25 @@ where
             // ── File-based circuit check ─────────────────────────────────────
             {
                 let guard = file_state.read().await;
-                if let Some(svc) = guard.get(&service_name) {
-                    if svc.status == CircuitStatus::Tripped {
-                        let reason = svc
-                            .reason
-                            .clone()
-                            .unwrap_or_else(|| "Consecutive health check failures".to_string());
-                        let since = svc.since.clone().unwrap_or_default();
-                        let failures = svc.consecutive_failures;
-                        drop(guard);
+                if let Some(svc) = guard.get(&service_name)
+                    && svc.status == CircuitStatus::Tripped
+                {
+                    let reason = svc
+                        .reason
+                        .clone()
+                        .unwrap_or_else(|| "Consecutive health check failures".to_string());
+                    let since = svc.since.clone().unwrap_or_default();
+                    let failures = svc.consecutive_failures;
+                    drop(guard);
 
-                        warn!(
-                            service = %service_name,
-                            failures = failures,
-                            since = %since,
-                            "Circuit breaker (file-based) TRIPPED — rejecting request"
-                        );
+                    warn!(
+                        service = %service_name,
+                        failures = failures,
+                        since = %since,
+                        "Circuit breaker (file-based) TRIPPED — rejecting request"
+                    );
 
-                        return Ok((
+                    return Ok((
                             StatusCode::SERVICE_UNAVAILABLE,
                             Json(json!({
                                 "error": "service_unavailable",
@@ -248,7 +249,6 @@ where
                             })),
                         )
                             .into_response());
-                    }
                 }
             }
 
