@@ -1,6 +1,6 @@
 [package]
 name = "hmac-circuit-breaker"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 authors = ["PQCrypta <allan@pqcrypta.com>"]
 description = "HMAC-protected circuit breaker with fail-open semantics. Persists circuit state to disk and verifies integrity with HMAC-SHA256 on every reload to prevent state-file tampering from inducing self-DoS."
@@ -10,7 +10,7 @@ documentation = "https://docs.rs/hmac-circuit-breaker"
 readme = "README.md"
 keywords = ["circuit-breaker", "hmac", "resilience", "fault-tolerance", "middleware"]
 categories = ["network-programming", "cryptography", "web-programming::http-server"]
-rust-version = "1.85"
+rust-version = "1.88"
 
 [features]
 default = ["reload"]
@@ -28,7 +28,7 @@ serde_json = "1"
 thiserror = "2"
 tracing   = "0.1"
 
-chrono = { version = "0.4", features = ["serde"] }
+jiff   = { version = "1.0", default-features = false, features = ["std"] }
 tokio  = { version = "1", features = ["time", "fs", "sync", "rt"], optional = true }
 axum   = { version = "0.8", optional = true }
 tower  = { version = "0.5", optional = true }
