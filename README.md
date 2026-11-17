@@ -576,6 +576,7 @@ version bump so existing producers and consumers continue to interoperate.
 ### v0.4.1 changes (this release)
 
 - **jiff replaces chrono**: chrono is unmaintained ([RUSTSEC-2026-0543](https://rustsec.org/advisories/RUSTSEC-2026-0543)), so `cargo audit --deny warnings` failed for every crate depending on this one. `updated_at` is still RFC 3339 in UTC, now ending in `Z` (`2026-11-17T21:06:52.123456789Z`) rather than `+00:00`, the form the examples above show. It stays a string the crate writes and never parses, so state files from 0.4.0 load unchanged.
+- **Minimum Rust 1.88**: a fresh resolve under 1.85 kept `ctutils` at 0.4.2 (through `digest` 0.11), whose mask generation and `u128` comparisons are not constant-time ([RUSTSEC-2026-0385](https://rustsec.org/advisories/RUSTSEC-2026-0385)). The fixed `ctutils` needs Rust 1.87 and `sha2` 0.11.1 needs 1.88.
 
 ### v0.4.0 changes
 

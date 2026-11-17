@@ -10,7 +10,7 @@ documentation = "https://docs.rs/hmac-circuit-breaker"
 readme = "README.md"
 keywords = ["circuit-breaker", "hmac", "resilience", "fault-tolerance", "middleware"]
 categories = ["network-programming", "cryptography", "web-programming::http-server"]
-rust-version = "1.85"
+rust-version = "1.88"
 
 [features]
 default = ["reload"]
