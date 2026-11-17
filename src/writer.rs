@@ -86,7 +86,7 @@ pub fn write_state(
     threshold: u32,
     secret: &str,
 ) -> Result<(), WriteError> {
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = jiff::Timestamp::now().to_string();
     let mut new_algorithms: BTreeMap<String, AlgorithmCircuitState> = BTreeMap::new();
 
     for obs in observations {
